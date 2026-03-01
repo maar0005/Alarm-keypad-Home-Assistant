@@ -619,30 +619,28 @@ sensor:
 # =============================================================================
 # PN532 NFC reader — I2C 0x24
 # =============================================================================
+# Fires HA's native tag_scanned event using the tag's physical UID.
+# In HA: Settings → Tags — add the tag there to give it a name, then create
+# an automation with trigger: platform: tag, tag_id: "<uid>".
+# First scan of an unknown tag → HA shows a notification to set it up.
 pn532_i2c:
   address: 0x24
   update_interval: 500ms
   on_tag:
     then:
-      - homeassistant.event:
-          event: "esphome.alarm_keypad_nfc_tag"
-          data:
-            uid: !lambda 'return x;'
-            device: "${device_name}"
+      - homeassistant.tag_scanned: !lambda 'return x;'
 
 # =============================================================================
-# Parallax RFID reader — UART
+# Parallax RFID reader — UART (125 kHz)
 # =============================================================================
+# Same native tag_scanned approach; the decimal tag ID is used as the tag_id.
+# Register in HA Settings → Tags using the decimal ID shown on first scan.
 rdm6300:
   uart_id: rfid_uart
   id: rfid_reader
   on_tag:
     then:
-      - homeassistant.event:
-          event: "esphome.alarm_keypad_rfid_tag"
-          data:
-            tag_id: !lambda 'return std::to_string(x);'
-            device: "${device_name}"
+      - homeassistant.tag_scanned: !lambda 'return std::to_string(x);'
 
 # =============================================================================
 # 1s interval — delay beeps + LCD backlight timer
