@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Alarm Keypad — Flash Firmware</title>
+  <script
+    type="module"
+    src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"
+  ></script>
+  <style>
+    :root {
+      --bg:      #0f172a;
+      --surface: #1e293b;
+      --border:  #334155;
+      --accent:  #3b82f6;
+      --text:    #f1f5f9;
+      --muted:   #94a3b8;
+      --green:   #22c55e;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem 1rem;
+      gap: 2rem;
+    }
+    h1 { font-size: 1.75rem; font-weight: 700; }
+    p  { color: var(--muted); line-height: 1.6; max-width: 36rem; text-align: center; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 1rem;
+      padding: 2rem;
+      max-width: 42rem;
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+    .steps { counter-reset: step; display: flex; flex-direction: column; gap: 1rem; }
+    .step {
+      display: flex;
+      gap: 1rem;
+      align-items: flex-start;
+    }
+    .step::before {
+      counter-increment: step;
+      content: counter(step);
+      min-width: 2rem;
+      height: 2rem;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.875rem;
+    }
+    .step p { text-align: left; color: var(--text); }
+    .step p small { color: var(--muted); display: block; margin-top: 0.25rem; font-size: 0.8rem; }
+    esp-web-install-button {
+      --esp-tools-button-color: var(--accent);
+      --esp-tools-button-text-color: #fff;
+      font-size: 1rem;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      background: #14532d;
+      color: var(--green);
+      border: 1px solid #166534;
+      border-radius: 0.5rem;
+      padding: 0.25rem 0.75rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+    footer { color: var(--muted); font-size: 0.8rem; }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div style="text-align:center">
+    <h1>🔐 Alarm Keypad</h1>
+    <p>Flash the factory firmware onto your device. Requires Chrome or Edge on desktop.</p>
+  </div>
+
+  <div class="card">
+    <div class="steps">
+      <div class="step">
+        <p>Connect the device to this computer via USB.</p>
+      </div>
+      <div class="step">
+        <p>Click <strong>Install</strong> below. Select the correct serial port when asked.
+          <small>Needs Chrome or Edge. Safari and Firefox do not support Web Serial.</small>
+        </p>
+      </div>
+      <div class="step">
+        <p>After flashing, the browser will ask you to configure WiFi. Enter your home WiFi credentials.
+          <small>Alternatively, power on the device and connect to the <em>"Alarm Keypad Setup"</em> hotspot from any phone.</small>
+        </p>
+      </div>
+      <div class="step">
+        <p>Open Home Assistant. The device will appear automatically. Add it using the shared API key.</p>
+      </div>
+      <div class="step">
+        <p>Send the <strong>6-character pairing code</strong> shown on the device LCD to HA to activate the keypad.
+          <small>See the setup guide in the repository for the HA automation / Blueprint.</small>
+        </p>
+      </div>
+    </div>
+
+    <div style="display:flex; gap:1rem; align-items:center; flex-wrap:wrap">
+      <esp-web-install-button manifest="manifest.json"></esp-web-install-button>
+      <span class="badge">✓ ESP32-S3</span>
+    </div>
+
+    <details style="color:var(--muted); font-size:0.85rem">
+      <summary style="cursor:pointer; user-select:none">HA API key &amp; OTA password</summary>
+      <pre style="margin-top:0.75rem; background:var(--bg); padding:0.75rem; border-radius:0.5rem; overflow-x:auto; font-size:0.8rem">
+API key : h2X47wkx8LQ7Tedqvw7e6QCFqWzkdL1GihMCvwyy3nQ=
+OTA pw  : alarm-keypad-factory-ota</pre>
+    </details>
+  </div>
+
+  <footer>
+    <a href="https://github.com/maar0005/Alarm-keypad-Home-Assistant" target="_blank">
+      maar0005/Alarm-keypad-Home-Assistant
+    </a>
+    &nbsp;·&nbsp; Firmware built with
+    <a href="https://esphome.io" target="_blank">ESPHome</a>
+    &nbsp;·&nbsp; Flashed via
+    <a href="https://esphome.github.io/esp-web-tools/" target="_blank">ESP Web Tools</a>
+  </footer>
+</body>
+</html>

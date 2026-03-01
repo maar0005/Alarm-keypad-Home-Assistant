@@ -31,23 +31,91 @@ reflashing needed.
 
 ---
 
+## Install (for distribution — friends never touch a compiler)
+
+> **[→ Flash firmware in your browser](https://maar0005.github.io/Alarm-keypad-Home-Assistant/flash/)**
+> Requires Chrome or Edge on desktop.
+
+After flashing, friends set up WiFi via the captive portal hotspot, then add the device in HA. See the [Friend Setup](#friend-setup) section below.
+
+---
+
+## Security Model
+
+The factory firmware uses three layers:
+
+| Layer | What it protects |
+|-------|-----------------|
+| **AES-256 API encryption** | All traffic between device and HA is ciphertext on the LAN |
+| **HMAC-SHA256 PIN hashing** | The raw PIN never leaves the device — only its HMAC is transmitted |
+| **6-char pairing code** | Unique per device (hardware RNG). HA must receive it before the keypad activates — proves physical access |
+
+```
+Device generates device_salt (hardware RNG) on first boot
+  → shows 6-char code on LCD: "Pair: A3F7K2"
+
+Keypad entry:  1 2 3 4 #
+  → computes HMAC-SHA256("1234", device_salt)
+  → fires HA event: { hmac: "e3b0c...", action: "disarm" }
+  → raw PIN never leaves the device
+
+HA Blueprint receives event
+  → verifies HMAC against stored expected value
+  → calls alarm_control_panel.alarm_disarm with the actual PIN
+```
+
+---
+
+## Friend Setup
+
+Friends receive a pre-flashed device. They need zero programming skills.
+
+```
+1. Power on device (USB or wall adapter)
+2. Connect phone to "Alarm Keypad Setup" WiFi hotspot
+3. Captive portal opens → enter home WiFi → device connects
+4. Open Home Assistant → device discovered automatically → click Add
+   API key: h2X47wkx8LQ7Tedqvw7e6QCFqWzkdL1GihMCvwyy3nQ=
+5. In HA → Alarm Keypad device page → send the Pairing Code shown on LCD
+6. Import HA Blueprint (docs/ha-blueprint.yaml) → compute expected HMAC → done
+```
+
+**Computing expected HMACs** (run once, any Python 3):
+```bash
+python3 -c "
+import hmac, hashlib
+salt = 'PASTE_DEVICE_SALT_FROM_HA'  # found in device diagnostics
+pin  = '1234'                        # your alarm PIN
+h = hmac.new(salt.encode(), pin.encode(), hashlib.sha256).hexdigest()
+print(h)
+"
+```
+
+---
+
 ## Repository Structure
 
 ```
 Alarm-keypad-Home-Assistant/
 ├── esphome/
-│   ├── alarm-keypad.yaml          # ESPHome config (keypad peripheral)
-│   └── secrets.yaml.template      # Copy → secrets.yaml and fill in
-├── 3d-print/
-│   ├── README.md                  # Print settings, cutout dimensions
-│   ├── front-plate/               # STL files (added when designed)
-│   └── back-plate/                # STL files (added when designed)
+│   ├── alarm-keypad.yaml            # ESPHome config (your own install, uses secrets.yaml)
+│   ├── alarm-keypad-factory.yaml    # Pre-built distribution firmware
+│   ├── alarm_keypad_security.h      # HMAC-SHA256 helpers (C++, used by factory fw)
+│   └── secrets.yaml.template        # Copy → secrets.yaml and fill in
+├── .github/workflows/
+│   └── build-firmware.yml           # Auto-builds factory binary on push to main
 ├── docs/
-│   ├── wiring-diagram.md          # Full pin reference with ASCII diagrams
-│   ├── bom.md                     # Bill of Materials with prices
-│   └── setup-guide.md             # Step-by-step build and integration guide
-├── ha-blueprints/
-│   └── alarm-keypad-automation.yaml  # RFID/NFC → arm/disarm blueprint
+│   ├── flash/
+│   │   ├── index.html               # Web flash page (GitHub Pages)
+│   │   └── manifest.json            # ESP Web Tools firmware manifest
+│   ├── ha-blueprint.yaml            # HA automation Blueprint (HMAC PIN verification)
+│   ├── wiring-diagram.md            # Full pin reference with ASCII diagrams
+│   ├── bom.md                       # Bill of Materials with prices
+│   └── setup-guide.md               # Step-by-step build and integration guide
+├── 3d-print/
+│   ├── README.md                    # Print settings, cutout dimensions
+│   ├── front-plate/                 # STL files (added when designed)
+│   └── back-plate/                  # STL files (added when designed)
 └── README.md
 ```
 

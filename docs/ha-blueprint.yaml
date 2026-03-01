@@ -1,0 +1,138 @@
+blueprint:
+  name: Alarm Keypad — HMAC PIN Verification
+  description: >
+    Handles `esphome.alarm_keypad_code` events from the Alarm Keypad factory
+    firmware.  The keypad never transmits the raw PIN — it sends
+    HMAC-SHA256(PIN, device_salt) instead.  This automation verifies the HMAC
+    server-side and calls the alarm_control_panel service only on a match.
+
+    **Setup steps (one-time per device)**
+
+    1. In Home Assistant, go to the Alarm Keypad device page.
+    2. Find the **Device Salt** diagnostic sensor and copy its value.
+    3. Compute the expected HMAC for each valid PIN using the helper script below.
+    4. Paste each expected HMAC into the fields below.
+
+    **Compute expected HMACs** (run once on any computer with Python 3):
+    ```
+    python3 -c "
+    import hmac, hashlib
+    salt = 'PASTE_DEVICE_SALT_HERE'
+    for pin in ['1234', '5678']:   # replace with your actual PINs
+        h = hmac.new(salt.encode(), pin.encode(), hashlib.sha256).hexdigest()
+        print(f'PIN {pin} → {h}')
+    "
+    ```
+
+  domain: automation
+  author: maar0005
+  source_url: https://github.com/maar0005/Alarm-keypad-Home-Assistant
+
+  input:
+    alarm_entity:
+      name: Alarm control panel
+      description: The alarm_control_panel entity to arm/disarm.
+      selector:
+        entity:
+          domain: alarm_control_panel
+
+    alarm_pin:
+      name: Alarm PIN (stored in HA, never sent to device)
+      description: >
+        The actual PIN used to call alarm_control_panel.alarm_disarm.
+        This stays inside HA — the device only ever receives a verification
+        result, never this value.
+      selector:
+        text:
+          type: password
+
+    disarm_hmac:
+      name: Expected disarm HMAC
+      description: >
+        HMAC-SHA256(disarm_PIN, device_salt).
+        Compute with the Python snippet in the description above.
+      selector:
+        text:
+
+    arm_away_hmac:
+      name: Expected arm-away HMAC (optional)
+      description: >
+        HMAC for a separate arm-away PIN, if you use a different code to arm.
+        Leave blank to use the same code for arm and disarm.
+      default: ""
+      selector:
+        text:
+
+    device_name:
+      name: Device name (for filtering)
+      description: >
+        The ESPHome device name, e.g. `alarm-keypad-a1b2c3`.
+        Filters events so multiple keypads can coexist.
+      default: ""
+      selector:
+        text:
+
+trigger:
+  - platform: event
+    event_type: esphome.alarm_keypad_code
+
+condition:
+  # If device_name is set, filter to that device only
+  - condition: template
+    value_template: >
+      {{ not inputs.device_name or
+         trigger.event.data.get('device','') == inputs.device_name }}
+
+action:
+  - variables:
+      received_hmac: "{{ trigger.event.data.get('hmac', '') }}"
+      action:        "{{ trigger.event.data.get('action', 'disarm') }}"
+      disarm_hmac:   "{{ inputs.disarm_hmac | lower }}"
+      arm_hmac:      "{{ inputs.arm_away_hmac | lower }}"
+      hmac_ok_disarm: "{{ received_hmac == disarm_hmac }}"
+      hmac_ok_arm:    "{{ arm_hmac != '' and received_hmac == arm_hmac }}"
+
+  - choose:
+      # ── Disarm ────────────────────────────────────────────────────────────
+      - conditions:
+          - condition: template
+            value_template: "{{ action == 'disarm' and hmac_ok_disarm }}"
+        sequence:
+          - service: alarm_control_panel.alarm_disarm
+            target:
+              entity_id: !input alarm_entity
+            data:
+              code: !input alarm_pin
+
+      # ── Arm away (HMAC code) ───────────────────────────────────────────────
+      - conditions:
+          - condition: template
+            value_template: "{{ action == 'arm_away' and hmac_ok_arm }}"
+        sequence:
+          - service: alarm_control_panel.alarm_arm_away
+            target:
+              entity_id: !input alarm_entity
+
+      # ── Arm away (disarm code used to arm) ────────────────────────────────
+      - conditions:
+          - condition: template
+            value_template: "{{ action == 'arm_away' and hmac_ok_disarm and not hmac_ok_arm }}"
+        sequence:
+          - service: alarm_control_panel.alarm_arm_away
+            target:
+              entity_id: !input alarm_entity
+
+      # ── Wrong HMAC → log warning ───────────────────────────────────────────
+      - conditions:
+          - condition: template
+            value_template: "{{ not hmac_ok_disarm and not hmac_ok_arm }}"
+        sequence:
+          - service: system_log.write
+            data:
+              message: >
+                Alarm Keypad: wrong HMAC received ({{ received_hmac[:8] }}...).
+                Possible wrong PIN or misconfigured Blueprint.
+              level: warning
+
+mode: single
+max_exceeded: silent
