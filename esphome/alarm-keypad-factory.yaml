@@ -1,0 +1,688 @@
+# =============================================================================
+# Alarm Keypad — Factory Firmware
+# =============================================================================
+#
+# Pre-built firmware for distribution.  You (the developer) flash this once
+# per device via USB.  Friends never need to touch a compiler.
+#
+# SECURITY MODEL
+# ──────────────
+# 1. Per-device random key — generated at first boot using the ESP32 hardware
+#    RNG (esp_fill_random).  32 bytes / 256 bits, stored in NVS.  Each device
+#    has a completely different key.  The key is shown on the device web page
+#    so the owner can copy it during setup without reading any documentation.
+#
+# 2. API transport encryption — the key is loaded at boot priority 400
+#    (before the API server accepts connections) and installed as the ESPHome
+#    Noise PSK.  All traffic between the device and HA is ciphertext on the
+#    LAN; a LAN observer cannot capture or replay keypad events.
+#
+# 3. PIN verification — the entered PIN is sent directly to HA over the
+#    encrypted API channel.  HA's alarm_control_panel verifies it against its
+#    own configured code.  No Blueprint or extra automation is required.
+#
+# FRIEND SETUP (zero flashing required, ~2/10 complexity)
+# ───────────────────────────────────────────────────────
+# 1. Power on → device creates "Alarm Keypad Setup" hotspot (open, no password)
+# 2. Connect phone → captive portal → enter home WiFi credentials
+# 3. HA discovers device → asks for API encryption key →
+#      open http://alarm-keypad.local/ → copy "Setup Key" → paste → done
+#    The keypad is now live.  No Blueprint, no automation, no extra steps.
+#
+# OTA password:         alarm-keypad-factory-ota
+# Default alarm entity: alarm_control_panel.home_alarm
+# =============================================================================
+
+substitutions:
+  device_name: alarm-keypad
+  friendly_name: "Alarm Keypad"
+  alarm_entity: "alarm_control_panel.home_alarm"
+  # Placeholder PSK — enables Noise encryption at compile time.
+  # Overwritten at boot priority 400 with the per-device random key from NVS.
+  api_key_placeholder: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  ota_password: "alarm-keypad-factory-ota"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: true    # → alarm-keypad-a1b2c3  (unique per device)
+  includes:
+    - alarm_keypad_security.h  # key generation, NVS helpers
+  on_boot:
+    # ── Priority 400: load/generate per-device key, install as API PSK ────────
+    # Runs after NVS is ready (preferences at 600) but before WiFi (200) and
+    # the API server (-100), so HA always sees the correct per-device PSK.
+    - priority: 400
+      then:
+        - lambda: |-
+            std::string key = ensure_device_key();
+            if (key.size() == 44) {
+              // Override the compiled placeholder PSK with the device key.
+              auto psk = key_to_psk(key);
+              id(my_api)->set_noise_psk(psk);
+              // Cache in globals for display use.
+              id(device_key)  = key;
+              id(device_code) = derive_display_code(key);
+              ESP_LOGI("factory", "Device key ready, ID: %s", id(device_code).c_str());
+            } else {
+              ESP_LOGE("factory", "Device key generation failed");
+            }
+
+    # ── Priority -10: post-WiFi/API tasks ─────────────────────────────────────
+    - priority: -10
+      then:
+        - lambda: 'id(boot_count) += 1;'
+        - component.update: exposed_setup_key  # push key value to web server
+        - light.turn_on:
+            id: status_led
+            effect: "Pulse Blue"
+        - delay: 2s
+        - component.update: my_lcd
+
+esp32:
+  board: um_feathers3
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+
+api:
+  id: my_api
+  encryption:
+    key: ${api_key_placeholder}   # placeholder; overwritten at boot priority 400
+
+ota:
+  - platform: esphome
+    password: ${ota_password}
+
+wifi:
+  # No SSID — improv_serial + captive_portal handle first-time WiFi setup.
+  ap:
+    ssid: "${friendly_name} Setup"
+    password: ""              # open AP: connect from any device, no password needed
+
+# Improv Serial: after USB flashing, ESP Web Tools walks you through WiFi
+# provisioning directly in the browser — no need to use the captive portal.
+improv_serial:
+
+captive_portal:
+
+# Web server at http://<device-ip>/  — shows all sensor values including the
+# Setup Key.  Copy the key from here during initial HA pairing.
+web_server:
+  port: 80
+
+# =============================================================================
+# I2C — SDA GPIO8, SCL GPIO9  (FeatherS3 STEMMA QT)
+# =============================================================================
+i2c:
+  sda: GPIO8
+  scl: GPIO9
+  scan: true
+  frequency: 100kHz
+
+# =============================================================================
+# UART — Parallax RFID reader (125 kHz)
+# =============================================================================
+uart:
+  id: rfid_uart
+  rx_pin: GPIO4
+  baud_rate: 2400
+
+# =============================================================================
+# Globals
+# =============================================================================
+globals:
+  - id: boot_count
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  # Per-device key loaded at boot priority 400 from NVS.
+  # NOT restore_value — managed directly via NVS helpers in security.h.
+  - id: device_key
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  # 6-char uppercase device identifier derived from device_key.
+  # Shown on LCD so the owner can identify which physical device they're
+  # looking at.  NOT a security gate.
+  - id: device_code
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  # Digit buffer for the current keypad entry session.
+  - id: entered_code
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  # Tracks previous HA alarm state for transition detection.
+  - id: last_alarm_state
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: lcd_backlight_timer
+    type: int
+    restore_value: false
+    initial_value: "30"
+
+  - id: lcd_dim
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+# =============================================================================
+# LCD 16×2 via I2C PCF8574 backpack (0x27)
+# =============================================================================
+display:
+  - platform: lcd_pcf8574
+    id: my_lcd
+    dimensions: 16x2
+    address: 0x27
+    update_interval: 500ms
+    lambda: |-
+      std::string st = id(ha_alarm_state).state;
+
+      if (st.empty()) {
+        // ── Not yet connected to HA ─────────────────────────────────────────
+        // Show device ID and status hint so user knows which device to look up.
+        std::string code = id(device_code).empty() ? "......" : id(device_code);
+        it.printf(0, 0, "ID: %-12s", code.c_str());
+
+        uint32_t tick = millis() / 2000;
+        switch (tick % 3) {
+          case 0: it.print(0, 1, "Open HA, add me "); break;
+          case 1: it.print(0, 1, "See web for key "); break;
+          case 2: it.print(0, 1, wifi_connected()
+                              ? "WiFi OK         "
+                              : "Connect WiFi AP "); break;
+        }
+      } else {
+        // ── Normal mode ─────────────────────────────────────────────────────
+        const char* label;
+        if      (st == "disarmed")       label = "DISARMED       ";
+        else if (st == "armed_away")     label = "ARMED AWAY     ";
+        else if (st == "armed_home")     label = "ARMED HOME     ";
+        else if (st == "armed_night")    label = "ARMED NIGHT    ";
+        else if (st == "armed_vacation") label = "ARMED VACATION ";
+        else if (st == "arming")         label = "ARMING...      ";
+        else if (st == "pending")        label = "ENTRY DELAY    ";
+        else if (st == "triggered")      label = "!! ALARM !!    ";
+        else                             label = "CONNECTING...  ";
+
+        it.print(0, 0, label);
+
+        if (id(lcd_message).state != "") {
+          it.printf(0, 1, "%-16s", id(lcd_message).state.c_str());
+        } else {
+          std::string dots(id(entered_code).length(), '*');
+          it.printf(0, 1, "%-16s", dots.c_str());
+        }
+      }
+
+# =============================================================================
+# NeoPixel — GPIO40 (FeatherS3 built-in)
+# =============================================================================
+light:
+  - platform: neopixelbus
+    id: status_led
+    type: GRB
+    variant: WS2812
+    pin: GPIO40
+    num_leds: 1
+    name: "${friendly_name} Status LED"
+    effects:
+      - pulse:
+          name: "Pulse Blue"
+          transition_length: 800ms
+          update_interval: 800ms
+      - pulse:
+          name: "Pulse Orange"
+          transition_length: 500ms
+          update_interval: 500ms
+      - automation:
+          name: "Alarm Flash"
+          sequence:
+            - light.turn_on:
+                id: status_led
+                red: 100%
+                green: 0%
+                blue: 0%
+                brightness: 100%
+                transition_length: 0s
+            - delay: 150ms
+            - light.turn_off:
+                id: status_led
+                transition_length: 0s
+            - delay: 150ms
+
+# =============================================================================
+# Passive buzzer — GPIO6
+# =============================================================================
+output:
+  - platform: ledc
+    id: buzzer_pwm
+    pin: GPIO6
+    frequency: 2000Hz
+
+rtttl:
+  output: buzzer_pwm
+
+# =============================================================================
+# Scripts — buzzer tones
+# =============================================================================
+script:
+  - id: beep_key
+    then:
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 1500Hz
+      - output.set_level:
+          id: buzzer_pwm
+          level: 50%
+      - delay: 60ms
+      - output.set_level:
+          id: buzzer_pwm
+          level: 0%
+
+  - id: beep_arm
+    then:
+      - rtttl.play: "arm:d=8,o=5,b=180:c,e,g"
+
+  - id: beep_disarm
+    then:
+      - rtttl.play: "disarm:d=8,o=5,b=180:g,e,c"
+
+  - id: beep_error
+    then:
+      - rtttl.play: "err:d=4,o=4,b=120:g,e,c"
+
+  - id: beep_delay_tick
+    then:
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 1000Hz
+      - output.set_level:
+          id: buzzer_pwm
+          level: 50%
+      - delay: 80ms
+      - output.set_level:
+          id: buzzer_pwm
+          level: 0%
+
+  - id: beep_triggered
+    mode: single
+    then:
+      - rtttl.play: "alarm:d=8,o=5,b=240:c6,p,c6,p,c6,p,c6"
+
+  # ── PIN submission ──────────────────────────────────────────────────────────
+  # Sends the entered PIN directly to HA over the encrypted API channel.
+  # HA's alarm_control_panel verifies it against its own configured code.
+  # No Blueprint or automation required.
+  - id: submit_code
+    then:
+      - if:
+          condition:
+            lambda: 'return id(entered_code).empty();'
+          then:
+            - script.execute: beep_error
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(ha_alarm_state).state == "disarmed";'
+                then:
+                  - homeassistant.service:
+                      service: alarm_control_panel.alarm_arm_away
+                      data:
+                        entity_id: "${alarm_entity}"
+                      data_template:
+                        code: !lambda 'return id(entered_code);'
+                else:
+                  - homeassistant.service:
+                      service: alarm_control_panel.alarm_disarm
+                      data:
+                        entity_id: "${alarm_entity}"
+                      data_template:
+                        code: !lambda 'return id(entered_code);'
+            - lambda: 'id(entered_code) = "";'
+
+# =============================================================================
+# Text sensors
+# =============================================================================
+text_sensor:
+  - platform: homeassistant
+    id: ha_alarm_state
+    entity_id: ${alarm_entity}
+    on_value:
+      then:
+        - lambda: |-
+            std::string s = x;
+            std::string prev = id(last_alarm_state);
+            id(last_alarm_state) = s;
+
+            if (s == "disarmed" && prev != "disarmed" && prev != "")
+              id(beep_disarm).execute();
+            else if ((s == "armed_away" || s == "armed_home" ||
+                      s == "armed_night" || s == "armed_vacation") &&
+                     prev == "arming")
+              id(beep_arm).execute();
+            else if (s == "triggered" && prev != "triggered")
+              id(beep_triggered).execute();
+            else if (s == "pending" && prev != "pending")
+              id(beep_delay_tick).execute();
+
+        - if:
+            condition:
+              lambda: 'return x == "disarmed";'
+            then:
+              - light.turn_on:
+                  id: status_led
+                  red: 0%
+                  green: 100%
+                  blue: 0%
+                  brightness: 40%
+                  effect: none
+
+        - if:
+            condition:
+              lambda: >-
+                return x == "armed_away" || x == "armed_home" ||
+                       x == "armed_night" || x == "armed_vacation";
+            then:
+              - light.turn_on:
+                  id: status_led
+                  red: 100%
+                  green: 0%
+                  blue: 0%
+                  brightness: 40%
+                  effect: none
+
+        - if:
+            condition:
+              lambda: 'return x == "arming";'
+            then:
+              - light.turn_on:
+                  id: status_led
+                  red: 100%
+                  green: 40%
+                  blue: 0%
+                  brightness: 60%
+                  effect: "Pulse Orange"
+
+        - if:
+            condition:
+              lambda: 'return x == "pending";'
+            then:
+              - light.turn_on:
+                  id: status_led
+                  effect: "Pulse Blue"
+
+        - if:
+            condition:
+              lambda: 'return x == "triggered";'
+            then:
+              - light.turn_on:
+                  id: status_led
+                  effect: "Alarm Flash"
+
+        - component.update: my_lcd
+
+  # ── Setup Key ──────────────────────────────────────────────────────────────
+  # The unique per-device key shown on the device web page.
+  # Copy this value when:
+  #   • HA asks for the API encryption key (during device discovery)
+  #   • The Blueprint asks for the Device Key field
+  - platform: template
+    id: exposed_setup_key
+    name: "${friendly_name} Setup Key"
+    icon: "mdi:key-variant"
+    lambda: |-
+      return id(device_key);
+    update_interval: never
+
+  - platform: wifi_info
+    ip_address:
+      name: "${friendly_name} IP Address"
+
+# =============================================================================
+# Text inputs from HA
+# =============================================================================
+text:
+  # ── LCD message override ────────────────────────────────────────────────────
+  - platform: template
+    id: lcd_message
+    name: "${friendly_name} LCD Message"
+    optimistic: true
+    min_length: 0
+    max_length: 16
+    mode: text
+    initial_value: ""
+
+# =============================================================================
+# 4×4 Membrane Keypad
+# =============================================================================
+matrix_keypad:
+  id: keypad
+  rows:
+    - pin: GPIO15
+    - pin: GPIO16
+    - pin: GPIO17
+    - pin: GPIO18
+  columns:
+    - pin:
+        number: GPIO11
+        mode: INPUT_PULLUP
+    - pin:
+        number: GPIO12
+        mode: INPUT_PULLUP
+    - pin:
+        number: GPIO13
+        mode: INPUT_PULLUP
+    - pin:
+        number: GPIO14
+        mode: INPUT_PULLUP
+  keys:
+    - "1234"
+    - "5678"
+    - "9*0#"
+    - "ABCD"
+  has_diodes: false
+  on_key_pressed:
+    then:
+      - lambda: |-
+          char k = x;
+
+          if (k == '#') {
+            id(submit_code).execute();
+          } else if (k == '*') {
+            id(entered_code) = "";
+            id(beep_key).execute();
+          } else if (k == 'A') {
+            id(beep_key).execute();
+          } else if (k == 'B') {
+            id(beep_key).execute();
+          } else if (k == 'C') {
+            id(beep_key).execute();
+          } else if (k == 'D') {
+            id(beep_key).execute();
+          } else {
+            if (id(entered_code).length() < 8) id(entered_code) += k;
+            id(beep_key).execute();
+          }
+
+      # Quick-arm shortcuts (no PIN required — HA panel decides whether to enforce)
+      - if:
+          condition:
+            lambda: 'return x == "A" && id(ha_alarm_state).state == "disarmed";'
+          then:
+            - homeassistant.service:
+                service: alarm_control_panel.alarm_arm_away
+                data:
+                  entity_id: ${alarm_entity}
+
+      - if:
+          condition:
+            lambda: 'return x == "B" && id(ha_alarm_state).state == "disarmed";'
+          then:
+            - homeassistant.service:
+                service: alarm_control_panel.alarm_arm_home
+                data:
+                  entity_id: ${alarm_entity}
+
+      - if:
+          condition:
+            lambda: 'return x == "C" && id(ha_alarm_state).state == "disarmed";'
+          then:
+            - homeassistant.service:
+                service: alarm_control_panel.alarm_arm_night
+                data:
+                  entity_id: ${alarm_entity}
+
+# =============================================================================
+# PIR Motion sensor — GPIO21
+# =============================================================================
+binary_sensor:
+  - platform: gpio
+    id: pir_sensor
+    pin:
+      number: GPIO21
+      mode: INPUT
+    name: "${friendly_name} Motion"
+    device_class: motion
+    on_press:
+      then:
+        - lambda: 'id(lcd_backlight_timer) = 30;'
+
+# =============================================================================
+# Sensors
+# =============================================================================
+sensor:
+  - platform: bme280_i2c
+    address: 0x76
+    update_interval: 60s
+    temperature:
+      name: "${friendly_name} Temperature"
+      id: bme_temp
+    humidity:
+      name: "${friendly_name} Humidity"
+      id: bme_humidity
+    pressure:
+      name: "${friendly_name} Pressure"
+      id: bme_pressure
+
+  - platform: bh1750
+    address: 0x23
+    name: "${friendly_name} Light Level"
+    id: light_level
+    update_interval: 10s
+    on_value:
+      then:
+        - lambda: 'id(lcd_dim) = (x < 10.0f);'
+
+  - platform: adc
+    pin: GPIO2
+    id: battery_voltage_raw
+    name: "${friendly_name} Battery Voltage"
+    update_interval: 30s
+    attenuation: 11dB
+    filters:
+      - multiply: 2.0
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - sensor.template.publish:
+            id: battery_percent
+            state: !lambda |-
+              float pct = (x - 3.0f) / (4.2f - 3.0f) * 100.0f;
+              return std::clamp(pct, 0.0f, 100.0f);
+
+  - platform: template
+    id: battery_percent
+    name: "${friendly_name} Battery"
+    unit_of_measurement: "%"
+    device_class: battery
+    accuracy_decimals: 0
+
+  - platform: wifi_signal
+    name: "${friendly_name} WiFi Signal"
+    update_interval: 60s
+
+  - platform: uptime
+    name: "${friendly_name} Uptime"
+
+# =============================================================================
+# PN532 NFC reader — I2C 0x24
+# =============================================================================
+# Fires HA's native tag_scanned event using the tag's physical UID.
+# In HA: Settings → Tags — add the tag there to give it a name, then create
+# an automation with trigger: platform: tag, tag_id: "<uid>".
+# First scan of an unknown tag → HA shows a notification to set it up.
+pn532_i2c:
+  address: 0x24
+  update_interval: 500ms
+  on_tag:
+    then:
+      - homeassistant.tag_scanned: !lambda 'return x;'
+
+# =============================================================================
+# Parallax RFID reader — UART (125 kHz)
+# =============================================================================
+# Same native tag_scanned approach; the decimal tag ID is used as the tag_id.
+# Register in HA Settings → Tags using the decimal ID shown on first scan.
+rdm6300:
+  uart_id: rfid_uart
+  id: rfid_reader
+  on_tag:
+    then:
+      - homeassistant.tag_scanned: !lambda 'return std::to_string(x);'
+
+# =============================================================================
+# 1s interval — delay beeps + LCD backlight timer
+# =============================================================================
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (id(lcd_backlight_timer) > 0) id(lcd_backlight_timer)--;
+
+      - if:
+          condition:
+            lambda: >-
+              return id(ha_alarm_state).state == "pending" ||
+                     id(ha_alarm_state).state == "arming";
+          then:
+            - script.execute: beep_delay_tick
+
+# =============================================================================
+# Buttons
+# =============================================================================
+button:
+  - platform: restart
+    name: "${friendly_name} Restart"
+
+  # Factory reset — generates a new random key, clears NVS, restarts device.
+  # Use when re-assigning the device to a new HA instance or new owner.
+  # After reset, HA must be reconfigured with the new Setup Key.
+  - platform: template
+    name: "${friendly_name} Factory Reset"
+    entity_category: config
+    on_press:
+      then:
+        - lambda: |-
+            std::string key = generate_device_key();
+            nvs_save_device_key(key);
+            id(device_key)  = key;
+            id(device_code) = derive_display_code(key);
+            auto psk = key_to_psk(key);
+            id(my_api)->set_noise_psk(psk);
+            id(entered_code) = "";
+            ESP_LOGW("factory", "Factory reset — new key ID: %s",
+                     id(device_code).c_str());
+        - component.update: exposed_setup_key
+        - component.update: my_lcd

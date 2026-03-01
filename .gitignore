@@ -1,0 +1,30 @@
+# ESPHome secrets — never commit real credentials
+esphome/secrets.yaml
+esphome/.esphome/
+
+# ESPHome build artefacts
+.esphome/
+esphome/build/
+esphome/config/
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/settings.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 3D print slicer project files (keep STLs, ignore slicer saves)
+*.3mf
+*.factory
+*.gcode
+*.bgcode
