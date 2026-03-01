@@ -1,0 +1,548 @@
+# =============================================================================
+# Alarm Keypad — ESPHome Configuration
+# Platform : Unexpected Maker FeatherS3 (ESP32-S3)
+# =============================================================================
+# See docs/wiring-diagram.md for full pin reference.
+# Copy secrets.yaml.template → secrets.yaml before flashing.
+# =============================================================================
+
+substitutions:
+  device_name: alarm-keypad
+  friendly_name: "Alarm Keypad"
+  # Arm / disarm PIN — override in secrets.yaml
+  alarm_pin: !secret alarm_pin
+  # How many wrong attempts before lockout
+  lockout_attempts: "3"
+  # Lockout duration in seconds
+  lockout_duration: "30"
+  # Entry delay in seconds (time to disarm after door opens)
+  entry_delay: "30"
+  # Exit delay in seconds (time to leave after arming)
+  exit_delay: "45"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -10
+    then:
+      - lambda: |-
+          id(boot_count) += 1;
+      - light.turn_on:
+          id: status_led
+          effect: "Pulse Blue"
+      - delay: 3s
+      - light.turn_off:
+          id: status_led
+
+esp32:
+  board: um_feathers3
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret fallback_password
+
+captive_portal:
+
+# =============================================================================
+# I2C Bus — SDA GPIO8, SCL GPIO9  (FeatherS3 STEMMA QT)
+# =============================================================================
+i2c:
+  sda: GPIO8
+  scl: GPIO9
+  scan: true
+  frequency: 100kHz
+
+# =============================================================================
+# UART — Parallax RFID reader (125 kHz)
+# RX: GPIO4   ENABLE: GPIO5  (drive LOW to read, HIGH to idle)
+# =============================================================================
+uart:
+  id: rfid_uart
+  rx_pin: GPIO4
+  baud_rate: 2400
+
+# =============================================================================
+# Globals
+# =============================================================================
+globals:
+  - id: boot_count
+    type: int
+    restore_value: true
+    initial_value: "0"
+  - id: wrong_attempts
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: locked_out
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: entered_code
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: arm_state
+    type: int
+    # 0=disarmed, 1=armed_away, 2=armed_home, 3=entry_delay, 4=exit_delay, 5=triggered
+    restore_value: true
+    initial_value: "0"
+
+# =============================================================================
+# 1602 LCD via I2C PCF8574 backpack (0x27)
+# =============================================================================
+display:
+  - platform: lcd_pcf8574
+    id: my_lcd
+    dimensions: 16x2
+    address: 0x27
+    update_interval: 500ms
+    lambda: |-
+      static const char* arm_labels[] = {
+        "DISARMED       ",
+        "ARMED AWAY     ",
+        "ARMED HOME     ",
+        "ENTRY DELAY    ",
+        "EXIT DELAY     ",
+        "!! ALARM !!    "
+      };
+      it.print(0, 0, arm_labels[id(arm_state)]);
+      // Second line: show entered code dots or custom message from HA
+      if (id(lcd_message).state != "") {
+        it.printf(0, 1, "%-16s", id(lcd_message).state.c_str());
+      } else {
+        std::string dots(id(entered_code).length(), '*');
+        it.printf(0, 1, "%-16s", dots.c_str());
+      }
+
+# =============================================================================
+# NeoPixel status LED — GPIO40 (FeatherS3 built-in NeoPixel)
+# =============================================================================
+light:
+  - platform: neopixelbus
+    id: status_led
+    type: GRB
+    variant: WS2812
+    pin: GPIO40
+    num_leds: 1
+    name: "${friendly_name} Status LED"
+    effects:
+      - pulse:
+          name: "Pulse Blue"
+          transition_length: 800ms
+          update_interval: 800ms
+      - pulse:
+          name: "Pulse Red"
+          transition_length: 400ms
+          update_interval: 400ms
+      - automation:
+          name: "Alarm Flash"
+          sequence:
+            - light.turn_on:
+                id: status_led
+                red: 100%
+                green: 0%
+                blue: 0%
+                brightness: 100%
+            - delay: 150ms
+            - light.turn_off:
+                id: status_led
+            - delay: 150ms
+
+# =============================================================================
+# Passive buzzer — GPIO6 via 2N7000 MOSFET gate
+# Using ledc (PWM) for tonal control
+# =============================================================================
+output:
+  - platform: ledc
+    id: buzzer_pwm
+    pin: GPIO6
+    frequency: 2000Hz
+
+rtttl:
+  output: buzzer_pwm
+  id: buzzer_player
+
+# Buzzer tone scripts
+script:
+  - id: beep_key
+    then:
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 1500Hz
+      - output.set_level:
+          id: buzzer_pwm
+          level: 50%
+      - delay: 60ms
+      - output.set_level:
+          id: buzzer_pwm
+          level: 0%
+
+  - id: beep_ok
+    then:
+      - rtttl.play: "ok:d=4,o=5,b=200:c,e,g"
+
+  - id: beep_error
+    then:
+      - rtttl.play: "err:d=4,o=4,b=150:g,e,c"
+
+  - id: beep_arm
+    then:
+      - rtttl.play: "arm:d=8,o=5,b=180:c,c,c,p,16c6"
+
+  - id: beep_disarm
+    then:
+      - rtttl.play: "disarm:d=8,o=5,b=180:16c6,p,c,c,c"
+
+  - id: entry_beep_sequence
+    # Accelerating beeps during entry countdown — call from automation
+    then:
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 1000Hz
+      - output.set_level:
+          id: buzzer_pwm
+          level: 50%
+      - delay: 100ms
+      - output.set_level:
+          id: buzzer_pwm
+          level: 0%
+
+  - id: process_code
+    then:
+      - lambda: |-
+          if (id(locked_out)) {
+            id(beep_error).execute();
+            return;
+          }
+          if (id(entered_code) == id(alarm_pin)) {
+            id(wrong_attempts) = 0;
+            id(entered_code) = "";
+            if (id(arm_state) == 0) {
+              // Disarmed → arm away
+              id(arm_state) = 4; // exit delay
+              id(beep_arm).execute();
+            } else {
+              // Armed/delay → disarm
+              id(arm_state) = 0;
+              id(beep_disarm).execute();
+            }
+          } else {
+            id(wrong_attempts) += 1;
+            id(entered_code) = "";
+            id(beep_error).execute();
+            if (id(wrong_attempts) >= ${lockout_attempts}) {
+              id(locked_out) = true;
+            }
+          }
+
+# =============================================================================
+# 4×4 Membrane Keypad
+# Rows: GPIO15, GPIO16, GPIO17, GPIO18
+# Cols: GPIO11, GPIO12, GPIO13, GPIO14
+# =============================================================================
+matrix_keypad:
+  id: keypad
+  rows:
+    - pin: GPIO15
+    - pin: GPIO16
+    - pin: GPIO17
+    - pin: GPIO18
+  columns:
+    - pin:
+        number: GPIO11
+        mode: INPUT_PULLUP
+    - pin:
+        number: GPIO12
+        mode: INPUT_PULLUP
+    - pin:
+        number: GPIO13
+        mode: INPUT_PULLUP
+    - pin:
+        number: GPIO14
+        mode: INPUT_PULLUP
+  keys:
+    - "1234"
+    - "5678"
+    - "9*0#"
+    - "ABCD"
+  has_diodes: false
+  on_key_pressed:
+    then:
+      - lambda: |-
+          char k = x;
+          if (id(locked_out)) {
+            id(beep_error).execute();
+            return;
+          }
+          if (k == '#') {
+            // Submit
+            id(process_code).execute();
+          } else if (k == '*') {
+            // Clear
+            id(entered_code) = "";
+            id(beep_key).execute();
+          } else if (k == 'A') {
+            // Arm away shortcut — still requires code
+            id(entered_code) = "";
+            id(beep_key).execute();
+          } else if (k == 'B') {
+            // Arm home shortcut
+            id(entered_code) = "";
+            id(beep_key).execute();
+          } else if (k == 'C' || k == 'D') {
+            id(beep_key).execute();
+          } else {
+            // Digit
+            if (id(entered_code).length() < 8) {
+              id(entered_code) += k;
+            }
+            id(beep_key).execute();
+          }
+
+# =============================================================================
+# PIR Motion sensor — HC-SR501, GPIO21
+# =============================================================================
+binary_sensor:
+  - platform: gpio
+    id: pir_sensor
+    pin:
+      number: GPIO21
+      mode: INPUT
+    name: "${friendly_name} Motion"
+    device_class: motion
+    on_press:
+      then:
+        # Wake LCD backlight on motion
+        - lambda: |-
+            id(lcd_backlight_timer) = 30;
+
+# =============================================================================
+# Sensors
+# =============================================================================
+sensor:
+  # BME280 — temperature, humidity, pressure
+  - platform: bme280_i2c
+    address: 0x76
+    update_interval: 60s
+    temperature:
+      name: "${friendly_name} Temperature"
+      id: bme_temp
+    humidity:
+      name: "${friendly_name} Humidity"
+      id: bme_humidity
+    pressure:
+      name: "${friendly_name} Pressure"
+      id: bme_pressure
+
+  # BH1750 — ambient light
+  - platform: bh1750
+    address: 0x23
+    name: "${friendly_name} Light Level"
+    id: light_level
+    update_interval: 10s
+    on_value:
+      then:
+        - lambda: |-
+            // Auto-dim LCD below 10 lux
+            if (x < 10.0f) {
+              id(lcd_dim) = true;
+            } else {
+              id(lcd_dim) = false;
+            }
+
+  # Battery voltage via ADC (FeatherS3 VBAT pin → GPIO2 via 1:2 divider)
+  - platform: adc
+    pin: GPIO2
+    id: battery_voltage_raw
+    name: "${friendly_name} Battery Voltage"
+    update_interval: 30s
+    attenuation: 11dB
+    filters:
+      - multiply: 2.0       # account for voltage divider
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    on_value:
+      then:
+        - sensor.template.publish:
+            id: battery_percent
+            state: !lambda |-
+              // LiPo: 4.2V = 100%, 3.0V = 0%
+              float pct = (x - 3.0f) / (4.2f - 3.0f) * 100.0f;
+              return std::clamp(pct, 0.0f, 100.0f);
+
+  - platform: template
+    id: battery_percent
+    name: "${friendly_name} Battery"
+    unit_of_measurement: "%"
+    device_class: battery
+    accuracy_decimals: 0
+
+  # WiFi signal strength
+  - platform: wifi_signal
+    name: "${friendly_name} WiFi Signal"
+    update_interval: 60s
+
+  # Uptime
+  - platform: uptime
+    name: "${friendly_name} Uptime"
+
+# =============================================================================
+# Text sensors
+# =============================================================================
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "${friendly_name} IP Address"
+  - platform: template
+    id: arm_state_text
+    name: "${friendly_name} Arm State"
+    lambda: |-
+      static const char* labels[] = {
+        "disarmed", "armed_away", "armed_home",
+        "entry_delay", "exit_delay", "triggered"
+      };
+      return {labels[id(arm_state)]};
+    update_interval: 1s
+  - platform: template
+    name: "${friendly_name} Boot Count"
+    lambda: |-
+      return {std::to_string(id(boot_count))};
+    update_interval: never
+
+# =============================================================================
+# Text input from HA (LCD message override)
+# =============================================================================
+text:
+  - platform: template
+    id: lcd_message
+    name: "${friendly_name} LCD Message"
+    optimistic: true
+    min_length: 0
+    max_length: 16
+    mode: text
+    initial_value: ""
+
+# =============================================================================
+# PN532 NFC reader — I2C 0x24
+# =============================================================================
+pn532_i2c:
+  address: 0x24
+  update_interval: 500ms
+  on_tag:
+    then:
+      - lambda: |-
+          ESP_LOGI("nfc", "Tag UID: %s", x.c_str());
+      # Publish to HA for whitelist comparison in automations
+      - homeassistant.event:
+          event: "esphome.alarm_keypad_nfc_tag"
+          data:
+            uid: !lambda 'return x;'
+            device: "${device_name}"
+
+# =============================================================================
+# Parallax RFID reader — UART 2400 baud
+# =============================================================================
+rdm6300:
+  uart_id: rfid_uart
+  id: rfid_reader
+  on_tag:
+    then:
+      - lambda: |-
+          ESP_LOGI("rfid", "Tag ID: %u", x);
+      - homeassistant.event:
+          event: "esphome.alarm_keypad_rfid_tag"
+          data:
+            tag_id: !lambda 'return std::to_string(x);'
+            device: "${device_name}"
+
+# =============================================================================
+# Lockout timer — runs every second
+# =============================================================================
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          // Lockout countdown
+          static int lockout_timer = 0;
+          if (id(locked_out)) {
+            lockout_timer++;
+            if (lockout_timer >= ${lockout_duration}) {
+              id(locked_out) = false;
+              id(wrong_attempts) = 0;
+              lockout_timer = 0;
+            }
+          }
+
+          // LCD backlight via PIR timer
+          static int& bl = id(lcd_backlight_timer);
+          if (bl > 0) bl--;
+
+# =============================================================================
+# Globals for timers (defined separately for lambda access)
+# =============================================================================
+# lcd_backlight_timer and lcd_dim are managed via lambda globals above;
+# declare them here so ESPHome sees them.
+
+# Hack: use globals component for the timer variables
+globals:
+  - id: lcd_backlight_timer
+    type: int
+    restore_value: false
+    initial_value: "30"
+  - id: lcd_dim
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: alarm_pin
+    type: std::string
+    restore_value: false
+    initial_value: '"${alarm_pin}"'
+
+# =============================================================================
+# HA-controlled switches / buttons
+# =============================================================================
+button:
+  - platform: template
+    name: "${friendly_name} Arm Away"
+    on_press:
+      - lambda: |-
+          if (id(arm_state) == 0) {
+            id(arm_state) = 4; // exit delay
+            id(beep_arm).execute();
+          }
+
+  - platform: template
+    name: "${friendly_name} Arm Home"
+    on_press:
+      - lambda: |-
+          if (id(arm_state) == 0) {
+            id(arm_state) = 2; // armed home (no exit delay)
+            id(beep_arm).execute();
+          }
+
+  - platform: template
+    name: "${friendly_name} Disarm"
+    on_press:
+      - lambda: |-
+          id(arm_state) = 0;
+          id(beep_disarm).execute();
+
+  - platform: restart
+    name: "${friendly_name} Restart"

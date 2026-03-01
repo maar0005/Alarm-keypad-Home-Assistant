@@ -1,0 +1,102 @@
+blueprint:
+  name: "Alarm Keypad — Arm/Disarm via RFID/NFC Tag"
+  description: >
+    Arm or disarm a Home Assistant Alarm Control Panel when a registered
+    RFID or NFC tag is scanned on the ESPHome alarm keypad.
+  domain: automation
+  input:
+    alarm_entity:
+      name: Alarm Control Panel
+      description: The HA alarm control panel to control.
+      selector:
+        entity:
+          domain: alarm_control_panel
+
+    alarm_code:
+      name: Alarm Code
+      description: >
+        The code used to disarm the alarm (must match your HA alarm panel code).
+        Leave blank if your panel does not require a code.
+      default: ""
+      selector:
+        text:
+          type: password
+
+    allowed_nfc_uids:
+      name: Allowed NFC Tag UIDs
+      description: >
+        Comma-separated list of NFC tag UIDs that are allowed to arm/disarm.
+        Find your tag UID in the HA logbook after first tap.
+        Example: "04:AB:CD:EF:12:34:56, 04:11:22:33:44:55:66"
+      default: ""
+      selector:
+        text:
+
+    allowed_rfid_ids:
+      name: Allowed RFID Tag IDs
+      description: >
+        Comma-separated list of RFID tag IDs (decimal) for the 125 kHz reader.
+        Find the tag ID in the HA logbook after first scan.
+      default: ""
+      selector:
+        text:
+
+    device_name:
+      name: ESPHome Device Name
+      description: The ESPHome device name (default is "alarm-keypad").
+      default: "alarm-keypad"
+      selector:
+        text:
+
+trigger:
+  - platform: event
+    event_type: "esphome.alarm_keypad_nfc_tag"
+    id: nfc_tag
+  - platform: event
+    event_type: "esphome.alarm_keypad_rfid_tag"
+    id: rfid_tag
+
+condition:
+  - condition: template
+    value_template: >
+      {% set dev = inputs.device_name %}
+      {% if trigger.id == 'nfc_tag' %}
+        {% set uid = trigger.event.data.uid | lower %}
+        {% set allowed = inputs.allowed_nfc_uids.split(',') | map('trim') | map('lower') | list %}
+        {{ uid in allowed and trigger.event.data.device == dev }}
+      {% elif trigger.id == 'rfid_tag' %}
+        {% set tag_id = trigger.event.data.tag_id | trim %}
+        {% set allowed = inputs.allowed_rfid_ids.split(',') | map('trim') | list %}
+        {{ tag_id in allowed and trigger.event.data.device == dev }}
+      {% else %}
+        false
+      {% endif %}
+
+action:
+  - choose:
+      - conditions:
+          - condition: state
+            entity_id: !input alarm_entity
+            state: "disarmed"
+        sequence:
+          - service: alarm_control_panel.alarm_arm_away
+            target:
+              entity_id: !input alarm_entity
+            data:
+              code: !input alarm_code
+      - conditions:
+          - condition: state
+            entity_id: !input alarm_entity
+            state:
+              - "armed_away"
+              - "armed_home"
+              - "armed_night"
+              - "pending"
+        sequence:
+          - service: alarm_control_panel.alarm_disarm
+            target:
+              entity_id: !input alarm_entity
+            data:
+              code: !input alarm_code
+
+mode: single
