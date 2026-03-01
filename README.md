@@ -42,54 +42,41 @@ After flashing, friends set up WiFi via the captive portal hotspot, then add the
 
 ## Security Model
 
-The factory firmware uses three layers:
-
-| Layer | What it protects |
-|-------|-----------------|
-| **AES-256 API encryption** | All traffic between device and HA is ciphertext on the LAN |
-| **HMAC-SHA256 PIN hashing** | The raw PIN never leaves the device — only its HMAC is transmitted |
-| **6-char pairing code** | Unique per device (hardware RNG). HA must receive it before the keypad activates — proves physical access |
+| Layer | What it does |
+|-------|-------------|
+| **Per-device random API key** | 32 bytes from ESP32 hardware RNG, generated at first boot and stored in NVS. Every device has a different key. |
+| **Noise-protocol transport encryption** | The key is installed as the ESPHome API PSK before the server starts. All HA ↔ device traffic is ciphertext on the LAN. |
+| **HA-internal PIN verification** | The entered PIN is sent over the encrypted channel; HA's `alarm_control_panel` verifies it against its own configured code. The PIN is never stored on the device. |
 
 ```
-Device generates device_salt (hardware RNG) on first boot
-  → shows 6-char code on LCD: "Pair: A3F7K2"
+First boot:
+  esp_fill_random() → 32 bytes → base64 → stored in NVS
+  → shown as "Setup Key" on http://alarm-keypad.local/
 
 Keypad entry:  1 2 3 4 #
-  → computes HMAC-SHA256("1234", device_salt)
-  → fires HA event: { hmac: "e3b0c...", action: "disarm" }
-  → raw PIN never leaves the device
+  → alarm_control_panel.alarm_disarm(code="1234")   ← over encrypted API
+  → HA verifies code internally → disarm or reject
 
-HA Blueprint receives event
-  → verifies HMAC against stored expected value
-  → calls alarm_control_panel.alarm_disarm with the actual PIN
+NFC / RFID scan:
+  → homeassistant.tag_scanned(uid)
+  → HA Tags system handles it — no Blueprint needed
 ```
 
 ---
 
 ## Friend Setup
 
-Friends receive a pre-flashed device. They need zero programming skills.
+Friends receive a pre-flashed device. No programming skills required.
 
 ```
-1. Power on device (USB or wall adapter)
-2. Connect phone to "Alarm Keypad Setup" WiFi hotspot
-3. Captive portal opens → enter home WiFi → device connects
-4. Open Home Assistant → device discovered automatically → click Add
-   API key: h2X47wkx8LQ7Tedqvw7e6QCFqWzkdL1GihMCvwyy3nQ=
-5. In HA → Alarm Keypad device page → send the Pairing Code shown on LCD
-6. Import HA Blueprint (docs/ha-blueprint.yaml) → compute expected HMAC → done
+1. Power on → connects to "Alarm Keypad Setup" WiFi hotspot
+2. Phone captive portal opens → enter home WiFi → device connects
+3. HA discovers device → asks for API encryption key
+   → open http://alarm-keypad.local/
+   → copy the "Setup Key" value → paste into HA → done
 ```
 
-**Computing expected HMACs** (run once, any Python 3):
-```bash
-python3 -c "
-import hmac, hashlib
-salt = 'PASTE_DEVICE_SALT_FROM_HA'  # found in device diagnostics
-pin  = '1234'                        # your alarm PIN
-h = hmac.new(salt.encode(), pin.encode(), hashlib.sha256).hexdigest()
-print(h)
-"
-```
+The keypad is immediately operational. No Blueprint, no automation, no pairing code.
 
 ---
 
@@ -100,7 +87,7 @@ Alarm-keypad-Home-Assistant/
 ├── esphome/
 │   ├── alarm-keypad.yaml            # ESPHome config (your own install, uses secrets.yaml)
 │   ├── alarm-keypad-factory.yaml    # Pre-built distribution firmware
-│   ├── alarm_keypad_security.h      # HMAC-SHA256 helpers (C++, used by factory fw)
+│   ├── alarm_keypad_security.h      # Key generation + NVS helpers (C++, used by factory fw)
 │   └── secrets.yaml.template        # Copy → secrets.yaml and fill in
 ├── .github/workflows/
 │   └── build-firmware.yml           # Auto-builds factory binary on push to main
@@ -108,7 +95,6 @@ Alarm-keypad-Home-Assistant/
 │   ├── flash/
 │   │   ├── index.html               # Web flash page (GitHub Pages)
 │   │   └── manifest.json            # ESP Web Tools firmware manifest
-│   ├── ha-blueprint.yaml            # HA automation Blueprint (HMAC PIN verification)
 │   ├── wiring-diagram.md            # Full pin reference with ASCII diagrams
 │   ├── bom.md                       # Bill of Materials with prices
 │   └── setup-guide.md               # Step-by-step build and integration guide
@@ -168,8 +154,8 @@ Alarm-keypad-Home-Assistant/
 | `A` key | Quick arm away (no code if `code_arm_required: false` in HA) |
 | `B` key | Quick arm home |
 | `C` key | Quick arm night |
-| RFID fob tap | HA event → blueprint → arm/disarm service call |
-| NFC tag tap | HA event → blueprint → arm/disarm service call |
+| RFID fob tap | HA native tag_scanned → automation → arm/disarm |
+| NFC tag tap | HA native tag_scanned → automation → arm/disarm |
 | Phone NFC | HA Companion app — no extra hardware |
 
 ---
