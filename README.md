@@ -1,8 +1,33 @@
 # Alarm Keypad — Home Assistant
 
-A DIY alarm keypad built on an **ESP32-S3 (FeatherS3)** running **ESPHome**, with native Home Assistant integration, OTA updates, and a 3D-printed PETG enclosure.
+A DIY alarm keypad built on an **ESP32-S3 (FeatherS3)** running **ESPHome**,
+designed as a physical input/display peripheral for **Home Assistant's built-in
+alarm control panel**.
 
-Supports arm/disarm via keypad code, RFID fob, NFC tag, and phone NFC (HA Companion app).
+The ESP32 owns no alarm logic. It mirrors HA's alarm state on the LCD and
+NeoPixel, forwards keypad codes and RFID/NFC scans to HA, and reacts to
+whatever state HA sends back — entry/exit delays, lockout, and notifications
+are all configured in HA.
+
+---
+
+## How It Works
+
+```
+HA Alarm Control Panel  ←── source of truth
+         │
+         │  state pushed to ESP (ESPHome API)
+         ▼
+   LCD + NeoPixel + Buzzer   (display)
+         │
+   Keypad / RFID / NFC       (input)
+         │
+         └──► alarm_control_panel.alarm_disarm / arm_away / arm_home …
+                        sent back to HA as service calls
+```
+
+Arm/disarm delays, wrong-code lockout, push notifications — all in HA, zero
+reflashing needed.
 
 ---
 
@@ -11,18 +36,18 @@ Supports arm/disarm via keypad code, RFID fob, NFC tag, and phone NFC (HA Compan
 ```
 Alarm-keypad-Home-Assistant/
 ├── esphome/
-│   ├── alarm-keypad.yaml          # Main ESPHome configuration
-│   └── secrets.yaml.template      # Template — copy to secrets.yaml and fill in
+│   ├── alarm-keypad.yaml          # ESPHome config (keypad peripheral)
+│   └── secrets.yaml.template      # Copy → secrets.yaml and fill in
 ├── 3d-print/
-│   ├── README.md                  # Print settings, material notes
-│   ├── front-plate/               # Front panel STL files
-│   └── back-plate/                # Back panel STL files
+│   ├── README.md                  # Print settings, cutout dimensions
+│   ├── front-plate/               # STL files (added when designed)
+│   └── back-plate/                # STL files (added when designed)
 ├── docs/
-│   ├── wiring-diagram.md          # Pin assignments and wiring guide
-│   ├── bom.md                     # Full Bill of Materials with links
-│   └── setup-guide.md             # Step-by-step build and flash guide
+│   ├── wiring-diagram.md          # Full pin reference with ASCII diagrams
+│   ├── bom.md                     # Bill of Materials with prices
+│   └── setup-guide.md             # Step-by-step build and integration guide
 ├── ha-blueprints/
-│   └── alarm-keypad-automation.yaml  # HA automation blueprint
+│   └── alarm-keypad-automation.yaml  # RFID/NFC → arm/disarm blueprint
 └── README.md
 ```
 
@@ -34,7 +59,8 @@ Alarm-keypad-Home-Assistant/
 |------|--------|
 | MCU | Unexpected Maker FeatherS3 (ESP32-S3) |
 | Firmware | ESPHome |
-| HA integration | Native API (no MQTT needed) |
+| HA integration | Native API — no MQTT needed |
+| Alarm logic | HA `alarm_control_panel` (manual or any platform) |
 | Updates | OTA over WiFi |
 | Power | USB-C 5V + LiPo 3.7V 1500mAh backup |
 
@@ -47,20 +73,20 @@ Alarm-keypad-Home-Assistant/
 | FeatherS3 (ESP32-S3) | — | Have |
 | Parallax RFID reader (125 kHz) | UART | Have |
 | 1602 LCD + I2C backpack (PCF8574) | I2C `0x27` | Have |
-| NeoPixel (built-in or external) | 1× GPIO | Have |
+| NeoPixel (built-in, GPIO40) | GPIO | Have |
 | PN532 NFC reader (13.56 MHz) | I2C `0x24` | Buy |
 | NTAG215 NFC stickers (10-pack) | — | Buy |
 | EM4100 RFID key fobs (10-pack) | — | Buy |
 | 4×4 membrane keypad | 8× GPIO | Buy |
-| Passive buzzer (~85 dB) | 1× GPIO via MOSFET | Buy |
+| Passive buzzer (~85 dB) | GPIO via MOSFET | Buy |
 | 2N7000 MOSFET | — | Buy |
 | BH1750 light sensor | I2C `0x23` | Buy |
-| HC-SR501 PIR motion sensor | 1× GPIO | Buy |
+| HC-SR501 PIR motion sensor | GPIO | Buy |
 | BME280 temp/humidity/pressure | I2C `0x76` | Buy |
-| LiPo battery 3.7V 1500mAh (JST-PH 2.0) | — | Buy |
+| LiPo 3.7V 1500mAh JST-PH 2.0 | — | Buy |
 | 5V USB-C power supply | — | Buy |
 | Proto PCB 5×7 cm | — | Buy |
-| Dupont wires + connectors | — | Buy |
+| Dupont wires | — | Buy |
 
 **Estimated cost for parts to buy: ~$22–28 USD**
 
@@ -68,17 +94,35 @@ Alarm-keypad-Home-Assistant/
 
 ## Arm / Disarm Methods
 
-1. **Keypad code** — 4×4 matrix; A/B/C/D act as function keys
-2. **RFID fob tap** — Parallax 125 kHz reader on the panel
-3. **NFC tag tap** — PN532 13.56 MHz reader on the panel
-4. **Phone NFC** — HA Companion app; no extra hardware needed
+| Method | How |
+|--------|-----|
+| Keypad code + `#` | Sends code to HA; HA validates and arms/disarms |
+| `A` key | Quick arm away (no code if `code_arm_required: false` in HA) |
+| `B` key | Quick arm home |
+| `C` key | Quick arm night |
+| RFID fob tap | HA event → blueprint → arm/disarm service call |
+| NFC tag tap | HA event → blueprint → arm/disarm service call |
+| Phone NFC | HA Companion app — no extra hardware |
+
+---
+
+## NeoPixel State Colours
+
+| HA Alarm State | Colour / Effect |
+|----------------|-----------------|
+| `disarmed` | Solid green |
+| `armed_away / home / night` | Solid red |
+| `arming` (exit delay) | Pulsing orange |
+| `pending` (entry delay) | Pulsing blue |
+| `triggered` | Flashing red |
+| Connecting / unavailable | Pulsing blue (boot) |
 
 ---
 
 ## I2C Bus
 
 ```
-SDA / SCL shared bus
+SDA GPIO8 / SCL GPIO9 (shared)
 ├── LCD PCF8574    0x27
 ├── PN532 NFC      0x24
 ├── BH1750 light   0x23
@@ -87,70 +131,59 @@ SDA / SCL shared bus
 
 ---
 
-## GPIO Usage Summary
+## GPIO Summary
 
 ```
-├── I2C SDA / SCL         2 pins
-├── UART RX + ENABLE      2 pins  (Parallax RFID)
-├── 4×4 keypad matrix     8 pins
-├── NeoPixel data         1 pin
-├── Buzzer (MOSFET gate)  1 pin
-├── PIR sensor input      1 pin
-└── Total                15 pins  — FeatherS3 handles it fine
+I2C SDA / SCL         2 pins  (GPIO8, GPIO9)
+UART RX + ENABLE      2 pins  (GPIO4, GPIO5)  — Parallax RFID
+4×4 keypad matrix     8 pins  (GPIO11–18)
+NeoPixel data         1 pin   (GPIO40)
+Buzzer MOSFET gate    1 pin   (GPIO6)
+PIR sensor input      1 pin   (GPIO21)
+Battery ADC           1 pin   (GPIO2)
+──────────────────────────────────────────
+Total                15 GPIO  — FeatherS3 handles it fine
 ```
 
-See [`docs/wiring-diagram.md`](docs/wiring-diagram.md) for exact pin numbers.
-
----
-
-## Features
-
-### Hardware-driven
-- Keypad entry with audible feedback per key press
-- Dual-reader NFC (13.56 MHz) + RFID (125 kHz) tag scanning
-- NeoPixel status LED — red / green / blue / pulsing per arm state
-- 1602 LCD — shows status, countdown, prompts; text settable from HA
-- Passive buzzer with distinct tones per event
-- PIR motion detection
-- Temperature, humidity, pressure (BME280)
-- Ambient light level (BH1750)
-- Battery backup with auto USB-C charging
-
-### Software (ESPHome / Home Assistant — no reflashing needed)
-- Entry / exit countdown with accelerating beeps
-- Wrong-code lockout + HA push notification
-- Battery percentage monitoring
-- WiFi signal strength reporting
-- LCD auto-dim based on ambient light (BH1750)
-- LCD wake-on-motion (PIR)
-- Uptime and boot status sensors
-- All thresholds and messages configurable from HA UI
-
----
-
-## Enclosure
-
-**3D-printed PETG**, sandwich design:
-
-```
-[ Front plate ]  — cutouts: LCD, keypad, NFC scan area, PIR lens, NeoPixel window
-[ Components  ]  — PCB, wiring
-[ Back plate  ]  — wall mount slots, USB-C access port, buzzer vents
-```
-
-See [`3d-print/README.md`](3d-print/README.md) for print settings and assembly notes.
+See [`docs/wiring-diagram.md`](docs/wiring-diagram.md) for full details.
 
 ---
 
 ## Quick Start
 
-1. Clone this repo
-2. Copy `esphome/secrets.yaml.template` → `esphome/secrets.yaml` and fill in your credentials
-3. Flash with `esphome run esphome/alarm-keypad.yaml`
-4. Add the device in Home Assistant (auto-discovered via mDNS)
-5. Import the blueprint from `ha-blueprints/` to set up automations
+```bash
+# 1. Clone
+git clone https://github.com/maar0005/Alarm-keypad-Home-Assistant
+cd Alarm-keypad-Home-Assistant
 
-Full instructions in [`docs/setup-guide.md`](docs/setup-guide.md).
+# 2. Configure secrets
+cp esphome/secrets.yaml.template esphome/secrets.yaml
+# Edit secrets.yaml — set alarm_entity to your HA alarm panel entity ID
+
+# 3. Flash (USB first time)
+esphome run esphome/alarm-keypad.yaml
+
+# 4. Add to HA — auto-discovered via mDNS
+
+# 5. Future updates — OTA
+esphome run esphome/alarm-keypad.yaml
+```
+
+Full instructions: [`docs/setup-guide.md`](docs/setup-guide.md)
+
+---
+
+## Enclosure
+
+3D-printed PETG, sandwich design:
+
+```
+[ Front plate ] — LCD window, keypad slot, NFC/PIR area, NeoPixel dot
+[ Components  ] — PCB, wiring
+[ Back plate  ] — wall-mount keyholes, USB-C slot, buzzer vents
+```
+
+See [`3d-print/README.md`](3d-print/README.md).
 
 ---
 

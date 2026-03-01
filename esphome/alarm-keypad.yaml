@@ -2,6 +2,11 @@
 # Alarm Keypad — ESPHome Configuration
 # Platform : Unexpected Maker FeatherS3 (ESP32-S3)
 # =============================================================================
+# This device is a pure keypad peripheral for HA's built-in alarm panel.
+# It mirrors the HA alarm_control_panel state and sends all arm/disarm
+# commands directly to that entity. HA owns all logic — entry/exit delays,
+# lockout, notifications, automations.
+#
 # See docs/wiring-diagram.md for full pin reference.
 # Copy secrets.yaml.template → secrets.yaml before flashing.
 # =============================================================================
@@ -9,16 +14,6 @@
 substitutions:
   device_name: alarm-keypad
   friendly_name: "Alarm Keypad"
-  # Arm / disarm PIN — override in secrets.yaml
-  alarm_pin: !secret alarm_pin
-  # How many wrong attempts before lockout
-  lockout_attempts: "3"
-  # Lockout duration in seconds
-  lockout_duration: "30"
-  # Entry delay in seconds (time to disarm after door opens)
-  entry_delay: "30"
-  # Exit delay in seconds (time to leave after arming)
-  exit_delay: "45"
 
 esphome:
   name: ${device_name}
@@ -32,8 +27,7 @@ esphome:
           id: status_led
           effect: "Pulse Blue"
       - delay: 3s
-      - light.turn_off:
-          id: status_led
+      - component.update: my_lcd
 
 esp32:
   board: um_feathers3
@@ -86,26 +80,35 @@ globals:
     type: int
     restore_value: true
     initial_value: "0"
-  - id: wrong_attempts
-    type: int
-    restore_value: false
-    initial_value: "0"
-  - id: locked_out
-    type: bool
-    restore_value: false
-    initial_value: "false"
+
+  # Buffer for digits typed on the keypad
   - id: entered_code
     type: std::string
     restore_value: false
     initial_value: '""'
-  - id: arm_state
+
+  # Tracks the previous HA alarm state so we can detect transitions
+  - id: last_alarm_state
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  # LCD backlight timer — seconds remaining before dim (reset by PIR)
+  - id: lcd_backlight_timer
     type: int
-    # 0=disarmed, 1=armed_away, 2=armed_home, 3=entry_delay, 4=exit_delay, 5=triggered
-    restore_value: true
-    initial_value: "0"
+    restore_value: false
+    initial_value: "30"
+
+  # Set true when BH1750 reads below dim threshold
+  - id: lcd_dim
+    type: bool
+    restore_value: false
+    initial_value: "false"
 
 # =============================================================================
 # 1602 LCD via I2C PCF8574 backpack (0x27)
+# Line 1: mirrors HA alarm panel state
+# Line 2: entered code dots (masked) OR HA-controlled message
 # =============================================================================
 display:
   - platform: lcd_pcf8574
@@ -114,16 +117,21 @@ display:
     address: 0x27
     update_interval: 500ms
     lambda: |-
-      static const char* arm_labels[] = {
-        "DISARMED       ",
-        "ARMED AWAY     ",
-        "ARMED HOME     ",
-        "ENTRY DELAY    ",
-        "EXIT DELAY     ",
-        "!! ALARM !!    "
-      };
-      it.print(0, 0, arm_labels[id(arm_state)]);
-      // Second line: show entered code dots or custom message from HA
+      std::string st = id(ha_alarm_state).state;
+      const char* label;
+      if      (st == "disarmed")     label = "DISARMED       ";
+      else if (st == "armed_away")   label = "ARMED AWAY     ";
+      else if (st == "armed_home")   label = "ARMED HOME     ";
+      else if (st == "armed_night")  label = "ARMED NIGHT    ";
+      else if (st == "armed_vacation") label = "ARMED VACATION ";
+      else if (st == "arming")       label = "ARMING...      ";
+      else if (st == "pending")      label = "ENTRY DELAY    ";
+      else if (st == "triggered")    label = "!! ALARM !!    ";
+      else                           label = "CONNECTING...  ";
+
+      it.print(0, 0, label);
+
+      // Line 2: HA message override, or masked code entry, or blank
       if (id(lcd_message).state != "") {
         it.printf(0, 1, "%-16s", id(lcd_message).state.c_str());
       } else {
@@ -132,7 +140,8 @@ display:
       }
 
 # =============================================================================
-# NeoPixel status LED — GPIO40 (FeatherS3 built-in NeoPixel)
+# NeoPixel — GPIO40 (FeatherS3 built-in)
+# Colour/effect mirrors HA alarm panel state
 # =============================================================================
 light:
   - platform: neopixelbus
@@ -148,9 +157,9 @@ light:
           transition_length: 800ms
           update_interval: 800ms
       - pulse:
-          name: "Pulse Red"
-          transition_length: 400ms
-          update_interval: 400ms
+          name: "Pulse Orange"
+          transition_length: 500ms
+          update_interval: 500ms
       - automation:
           name: "Alarm Flash"
           sequence:
@@ -160,14 +169,15 @@ light:
                 green: 0%
                 blue: 0%
                 brightness: 100%
+                transition_length: 0s
             - delay: 150ms
             - light.turn_off:
                 id: status_led
+                transition_length: 0s
             - delay: 150ms
 
 # =============================================================================
-# Passive buzzer — GPIO6 via 2N7000 MOSFET gate
-# Using ledc (PWM) for tonal control
+# Passive buzzer — GPIO6 via 2N7000 MOSFET gate (PWM / RTTTL)
 # =============================================================================
 output:
   - platform: ledc
@@ -177,10 +187,12 @@ output:
 
 rtttl:
   output: buzzer_pwm
-  id: buzzer_player
 
-# Buzzer tone scripts
+# =============================================================================
+# Scripts — buzzer tones
+# =============================================================================
 script:
+  # Short click per keypress
   - id: beep_key
     then:
       - output.ledc.set_frequency:
@@ -194,24 +206,23 @@ script:
           id: buzzer_pwm
           level: 0%
 
-  - id: beep_ok
-    then:
-      - rtttl.play: "ok:d=4,o=5,b=200:c,e,g"
-
-  - id: beep_error
-    then:
-      - rtttl.play: "err:d=4,o=4,b=150:g,e,c"
-
+  # Three rising tones — played when HA confirms armed
   - id: beep_arm
     then:
-      - rtttl.play: "arm:d=8,o=5,b=180:c,c,c,p,16c6"
+      - rtttl.play: "arm:d=8,o=5,b=180:c,e,g"
 
+  # Three falling tones — played when HA confirms disarmed
   - id: beep_disarm
     then:
-      - rtttl.play: "disarm:d=8,o=5,b=180:16c6,p,c,c,c"
+      - rtttl.play: "disarm:d=8,o=5,b=180:g,e,c"
 
-  - id: entry_beep_sequence
-    # Accelerating beeps during entry countdown — call from automation
+  # Rejection — wrong code or action refused by HA
+  - id: beep_error
+    then:
+      - rtttl.play: "err:d=4,o=4,b=120:g,e,c"
+
+  # Short beep used every second during entry/exit delay
+  - id: beep_delay_tick
     then:
       - output.ledc.set_frequency:
           id: buzzer_pwm
@@ -219,43 +230,167 @@ script:
       - output.set_level:
           id: buzzer_pwm
           level: 50%
-      - delay: 100ms
+      - delay: 80ms
       - output.set_level:
           id: buzzer_pwm
           level: 0%
 
-  - id: process_code
+  # Triggered alarm — short urgent burst
+  - id: beep_triggered
+    mode: single
     then:
-      - lambda: |-
-          if (id(locked_out)) {
-            id(beep_error).execute();
-            return;
-          }
-          if (id(entered_code) == id(alarm_pin)) {
-            id(wrong_attempts) = 0;
-            id(entered_code) = "";
-            if (id(arm_state) == 0) {
-              // Disarmed → arm away
-              id(arm_state) = 4; // exit delay
-              id(beep_arm).execute();
-            } else {
-              // Armed/delay → disarm
-              id(arm_state) = 0;
+      - rtttl.play: "alarm:d=8,o=5,b=240:c6,p,c6,p,c6,p,c6"
+
+  # Submit the entered code to HA alarm panel.
+  # HA decides if it's right/wrong — no local PIN checking.
+  # Arm if disarmed, disarm if armed/pending/arming.
+  - id: submit_code
+    then:
+      - if:
+          condition:
+            lambda: 'return id(entered_code).empty();'
+          then:
+            - script.execute: beep_error
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(ha_alarm_state).state == "disarmed";'
+                then:
+                  - homeassistant.service:
+                      service: alarm_control_panel.alarm_arm_away
+                      data:
+                        entity_id: !secret alarm_entity
+                        code: !lambda 'return id(entered_code);'
+                else:
+                  - homeassistant.service:
+                      service: alarm_control_panel.alarm_disarm
+                      data:
+                        entity_id: !secret alarm_entity
+                        code: !lambda 'return id(entered_code);'
+            - lambda: 'id(entered_code) = "";'
+
+# =============================================================================
+# Text sensor — mirrors HA alarm_control_panel state (source of truth)
+# Drives NeoPixel colour and buzzer tones on every state transition.
+# =============================================================================
+text_sensor:
+  - platform: homeassistant
+    id: ha_alarm_state
+    entity_id: !secret alarm_entity
+    on_value:
+      then:
+        - lambda: |-
+            std::string s = x;
+            std::string prev = id(last_alarm_state);
+            id(last_alarm_state) = s;
+
+            // --- Tones on state transitions ---
+            if (s == "disarmed" && prev != "disarmed" && prev != "") {
               id(beep_disarm).execute();
+            } else if ((s == "armed_away" || s == "armed_home" ||
+                        s == "armed_night" || s == "armed_vacation") &&
+                       prev == "arming") {
+              id(beep_arm).execute();
+            } else if (s == "triggered" && prev != "triggered") {
+              id(beep_triggered).execute();
+            } else if (s == "pending" && prev != "pending") {
+              // Entry delay started — first tick immediately
+              id(beep_delay_tick).execute();
             }
-          } else {
-            id(wrong_attempts) += 1;
-            id(entered_code) = "";
-            id(beep_error).execute();
-            if (id(wrong_attempts) >= ${lockout_attempts}) {
-              id(locked_out) = true;
-            }
-          }
+
+        # --- NeoPixel colour per state ---
+        - if:
+            condition:
+              lambda: 'return x == "disarmed";'
+            then:
+              - light.turn_on:
+                  id: status_led
+                  red: 0%
+                  green: 100%
+                  blue: 0%
+                  brightness: 40%
+                  effect: none
+
+        - if:
+            condition:
+              lambda: >-
+                return x == "armed_away" || x == "armed_home" ||
+                       x == "armed_night" || x == "armed_vacation";
+            then:
+              - light.turn_on:
+                  id: status_led
+                  red: 100%
+                  green: 0%
+                  blue: 0%
+                  brightness: 40%
+                  effect: none
+
+        - if:
+            condition:
+              lambda: 'return x == "arming";'
+            then:
+              - light.turn_on:
+                  id: status_led
+                  red: 100%
+                  green: 40%
+                  blue: 0%
+                  brightness: 60%
+                  effect: "Pulse Orange"
+
+        - if:
+            condition:
+              lambda: 'return x == "pending";'
+            then:
+              - light.turn_on:
+                  id: status_led
+                  effect: "Pulse Blue"
+
+        - if:
+            condition:
+              lambda: 'return x == "triggered";'
+            then:
+              - light.turn_on:
+                  id: status_led
+                  effect: "Alarm Flash"
+
+        - component.update: my_lcd
+
+  - platform: wifi_info
+    ip_address:
+      name: "${friendly_name} IP Address"
+
+  - platform: template
+    name: "${friendly_name} Boot Count"
+    lambda: |-
+      return {std::to_string(id(boot_count))};
+    update_interval: never
+
+# =============================================================================
+# Text input from HA — overrides LCD line 2 (e.g. "Welcome home!")
+# =============================================================================
+text:
+  - platform: template
+    id: lcd_message
+    name: "${friendly_name} LCD Message"
+    optimistic: true
+    min_length: 0
+    max_length: 16
+    mode: text
+    initial_value: ""
 
 # =============================================================================
 # 4×4 Membrane Keypad
-# Rows: GPIO15, GPIO16, GPIO17, GPIO18
-# Cols: GPIO11, GPIO12, GPIO13, GPIO14
+# Rows: GPIO15–18   Cols: GPIO11–14
+#
+# Key layout:
+#   [ 1 ][ 2 ][ 3 ][ A → Arm Away  ]
+#   [ 4 ][ 5 ][ 6 ][ B → Arm Home  ]
+#   [ 7 ][ 8 ][ 9 ][ C → Arm Night ]
+#   [ * ][ 0 ][ # ][ D → (spare)   ]
+#
+#   #  = submit entered code to HA
+#   *  = clear entry buffer
+#   A/B/C = quick-arm (no code; HA config determines if code required)
 # =============================================================================
 matrix_keypad:
   id: keypad
@@ -287,37 +422,65 @@ matrix_keypad:
     then:
       - lambda: |-
           char k = x;
-          if (id(locked_out)) {
-            id(beep_error).execute();
-            return;
-          }
+
           if (k == '#') {
-            // Submit
-            id(process_code).execute();
+            id(submit_code).execute();
+
           } else if (k == '*') {
-            // Clear
             id(entered_code) = "";
             id(beep_key).execute();
+
           } else if (k == 'A') {
-            // Arm away shortcut — still requires code
-            id(entered_code) = "";
+            // Quick arm away — code only if HA panel requires it for arming
             id(beep_key).execute();
+            if (id(ha_alarm_state).state == "disarmed") {
+              id(beep_arm).execute();
+            }
           } else if (k == 'B') {
-            // Arm home shortcut
-            id(entered_code) = "";
             id(beep_key).execute();
-          } else if (k == 'C' || k == 'D') {
+          } else if (k == 'C') {
+            id(beep_key).execute();
+          } else if (k == 'D') {
             id(beep_key).execute();
           } else {
-            // Digit
+            // Digit — max 8 characters
             if (id(entered_code).length() < 8) {
               id(entered_code) += k;
             }
             id(beep_key).execute();
           }
 
+      # Quick-arm shortcuts — fire after beep_key finishes
+      - if:
+          condition:
+            lambda: 'return x == "A" && id(ha_alarm_state).state == "disarmed";'
+          then:
+            - homeassistant.service:
+                service: alarm_control_panel.alarm_arm_away
+                data:
+                  entity_id: !secret alarm_entity
+
+      - if:
+          condition:
+            lambda: 'return x == "B" && id(ha_alarm_state).state == "disarmed";'
+          then:
+            - homeassistant.service:
+                service: alarm_control_panel.alarm_arm_home
+                data:
+                  entity_id: !secret alarm_entity
+
+      - if:
+          condition:
+            lambda: 'return x == "C" && id(ha_alarm_state).state == "disarmed";'
+          then:
+            - homeassistant.service:
+                service: alarm_control_panel.alarm_arm_night
+                data:
+                  entity_id: !secret alarm_entity
+
 # =============================================================================
 # PIR Motion sensor — HC-SR501, GPIO21
+# Wakes LCD backlight when motion is detected
 # =============================================================================
 binary_sensor:
   - platform: gpio
@@ -329,7 +492,6 @@ binary_sensor:
     device_class: motion
     on_press:
       then:
-        # Wake LCD backlight on motion
         - lambda: |-
             id(lcd_backlight_timer) = 30;
 
@@ -351,7 +513,7 @@ sensor:
       name: "${friendly_name} Pressure"
       id: bme_pressure
 
-  # BH1750 — ambient light
+  # BH1750 — ambient light; drives LCD auto-dim
   - platform: bh1750
     address: 0x23
     name: "${friendly_name} Light Level"
@@ -360,14 +522,9 @@ sensor:
     on_value:
       then:
         - lambda: |-
-            // Auto-dim LCD below 10 lux
-            if (x < 10.0f) {
-              id(lcd_dim) = true;
-            } else {
-              id(lcd_dim) = false;
-            }
+            id(lcd_dim) = (x < 10.0f);
 
-  # Battery voltage via ADC (FeatherS3 VBAT pin → GPIO2 via 1:2 divider)
+  # Battery voltage — FeatherS3 VBAT divider on GPIO2
   - platform: adc
     pin: GPIO2
     id: battery_voltage_raw
@@ -375,7 +532,7 @@ sensor:
     update_interval: 30s
     attenuation: 11dB
     filters:
-      - multiply: 2.0       # account for voltage divider
+      - multiply: 2.0
     unit_of_measurement: "V"
     accuracy_decimals: 2
     on_value:
@@ -383,7 +540,6 @@ sensor:
         - sensor.template.publish:
             id: battery_percent
             state: !lambda |-
-              // LiPo: 4.2V = 100%, 3.0V = 0%
               float pct = (x - 3.0f) / (4.2f - 3.0f) * 100.0f;
               return std::clamp(pct, 0.0f, 100.0f);
 
@@ -394,53 +550,16 @@ sensor:
     device_class: battery
     accuracy_decimals: 0
 
-  # WiFi signal strength
   - platform: wifi_signal
     name: "${friendly_name} WiFi Signal"
     update_interval: 60s
 
-  # Uptime
   - platform: uptime
     name: "${friendly_name} Uptime"
 
 # =============================================================================
-# Text sensors
-# =============================================================================
-text_sensor:
-  - platform: wifi_info
-    ip_address:
-      name: "${friendly_name} IP Address"
-  - platform: template
-    id: arm_state_text
-    name: "${friendly_name} Arm State"
-    lambda: |-
-      static const char* labels[] = {
-        "disarmed", "armed_away", "armed_home",
-        "entry_delay", "exit_delay", "triggered"
-      };
-      return {labels[id(arm_state)]};
-    update_interval: 1s
-  - platform: template
-    name: "${friendly_name} Boot Count"
-    lambda: |-
-      return {std::to_string(id(boot_count))};
-    update_interval: never
-
-# =============================================================================
-# Text input from HA (LCD message override)
-# =============================================================================
-text:
-  - platform: template
-    id: lcd_message
-    name: "${friendly_name} LCD Message"
-    optimistic: true
-    min_length: 0
-    max_length: 16
-    mode: text
-    initial_value: ""
-
-# =============================================================================
 # PN532 NFC reader — I2C 0x24
+# Fires an HA event with the tag UID — handle whitelisting in HA automations.
 # =============================================================================
 pn532_i2c:
   address: 0x24
@@ -449,7 +568,6 @@ pn532_i2c:
     then:
       - lambda: |-
           ESP_LOGI("nfc", "Tag UID: %s", x.c_str());
-      # Publish to HA for whitelist comparison in automations
       - homeassistant.event:
           event: "esphome.alarm_keypad_nfc_tag"
           data:
@@ -458,6 +576,7 @@ pn532_i2c:
 
 # =============================================================================
 # Parallax RFID reader — UART 2400 baud
+# Fires an HA event with the tag ID — handle whitelisting in HA automations.
 # =============================================================================
 rdm6300:
   uart_id: rfid_uart
@@ -473,76 +592,28 @@ rdm6300:
             device: "${device_name}"
 
 # =============================================================================
-# Lockout timer — runs every second
+# Interval — 1 s tick
+# Beeps during entry/exit delays; manages LCD backlight timer
 # =============================================================================
 interval:
   - interval: 1s
     then:
       - lambda: |-
-          // Lockout countdown
-          static int lockout_timer = 0;
-          if (id(locked_out)) {
-            lockout_timer++;
-            if (lockout_timer >= ${lockout_duration}) {
-              id(locked_out) = false;
-              id(wrong_attempts) = 0;
-              lockout_timer = 0;
-            }
-          }
+          // LCD backlight countdown (reset by PIR)
+          if (id(lcd_backlight_timer) > 0) id(lcd_backlight_timer)--;
 
-          // LCD backlight via PIR timer
-          static int& bl = id(lcd_backlight_timer);
-          if (bl > 0) bl--;
+      # Audible tick during entry delay (pending) and exit delay (arming)
+      - if:
+          condition:
+            lambda: >-
+              return id(ha_alarm_state).state == "pending" ||
+                     id(ha_alarm_state).state == "arming";
+          then:
+            - script.execute: beep_delay_tick
 
 # =============================================================================
-# Globals for timers (defined separately for lambda access)
-# =============================================================================
-# lcd_backlight_timer and lcd_dim are managed via lambda globals above;
-# declare them here so ESPHome sees them.
-
-# Hack: use globals component for the timer variables
-globals:
-  - id: lcd_backlight_timer
-    type: int
-    restore_value: false
-    initial_value: "30"
-  - id: lcd_dim
-    type: bool
-    restore_value: false
-    initial_value: "false"
-  - id: alarm_pin
-    type: std::string
-    restore_value: false
-    initial_value: '"${alarm_pin}"'
-
-# =============================================================================
-# HA-controlled switches / buttons
+# Restart button (visible in HA)
 # =============================================================================
 button:
-  - platform: template
-    name: "${friendly_name} Arm Away"
-    on_press:
-      - lambda: |-
-          if (id(arm_state) == 0) {
-            id(arm_state) = 4; // exit delay
-            id(beep_arm).execute();
-          }
-
-  - platform: template
-    name: "${friendly_name} Arm Home"
-    on_press:
-      - lambda: |-
-          if (id(arm_state) == 0) {
-            id(arm_state) = 2; // armed home (no exit delay)
-            id(beep_arm).execute();
-          }
-
-  - platform: template
-    name: "${friendly_name} Disarm"
-    on_press:
-      - lambda: |-
-          id(arm_state) = 0;
-          id(beep_disarm).execute();
-
   - platform: restart
     name: "${friendly_name} Restart"
