@@ -9,25 +9,17 @@
 // ESP32 hardware RNG.  The key is:
 //
 //   1. Stored in NVS (survives reboots, wiped only on factory reset).
-//   2. Used as the ESPHome API encryption PSK — all traffic between the device
-//      and HA is ciphertext (Noise_NNpsk0 protocol).
-//   3. Used as the HMAC key for PIN hashing — SHA-256(key + PIN).  The raw
-//      PIN never leaves the device; only the hash is sent to HA.
-//
-// ONE KEY, TWO JOBS — the user copies it once from the device web page and
-// pastes it in two places: HA API pairing, then the Blueprint.
-//
-// HA verifies the PIN hash with: {{ (device_key + alarm_pin) | hash('sha256') }}
-// No Python or external tools required.
+//   2. Installed as the ESPHome API Noise PSK at boot priority 400, before the
+//      API server accepts connections.  All HA traffic is ciphertext.
+//   3. Shown on the device web page so the owner can copy it into HA during
+//      the initial pairing step — no Blueprint, no extra automation.
 // =============================================================================
 
 #include <string>
 #include <array>
-#include <vector>
 #include <cstdio>
 #include <cctype>
 #include <cstring>
-#include "mbedtls/sha256.h"
 #include "mbedtls/base64.h"
 #include "esp_random.h"   // hardware RNG on ESP32
 #include "nvs_flash.h"
@@ -38,28 +30,6 @@
 // (before the API server initialises).
 static const char* KP_NVS_NS  = "kp_key";
 static const char* KP_NVS_KEY = "dev_key";
-
-// -----------------------------------------------------------------------------
-// sha256_hex(input) → 64-char lowercase hex string
-//
-// Device computes: SHA-256(device_key_base64 + entered_pin)
-// HA verifies with: {{ (device_key + alarm_pin) | hash('sha256') }}
-// -----------------------------------------------------------------------------
-inline std::string sha256_hex(const std::string& input) {
-    uint8_t raw[32];
-    mbedtls_sha256_context ctx;
-    mbedtls_sha256_init(&ctx);
-    mbedtls_sha256_starts(&ctx, /*is_224=*/0);
-    mbedtls_sha256_update(&ctx,
-        reinterpret_cast<const unsigned char*>(input.data()), input.size());
-    mbedtls_sha256_finish(&ctx, raw);
-    mbedtls_sha256_free(&ctx);
-
-    char hex[65];
-    for (int i = 0; i < 32; i++) sprintf(hex + 2 * i, "%02x", raw[i]);
-    hex[64] = '\0';
-    return std::string(hex);
-}
 
 // -----------------------------------------------------------------------------
 // generate_device_key() → 32 random bytes encoded as base64 (44 chars)

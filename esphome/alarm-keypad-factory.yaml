@@ -12,24 +12,22 @@
 #    has a completely different key.  The key is shown on the device web page
 #    so the owner can copy it during setup without reading any documentation.
 #
-# 2. API transport encryption — the same key is loaded at boot priority 400
+# 2. API transport encryption — the key is loaded at boot priority 400
 #    (before the API server accepts connections) and installed as the ESPHome
 #    Noise PSK.  All traffic between the device and HA is ciphertext on the
 #    LAN; a LAN observer cannot capture or replay keypad events.
 #
-# 3. PIN hashing — the raw PIN is NEVER sent.  The device computes
-#    SHA-256(device_key_base64 + entered_pin) and fires an HA event with only
-#    the hash.  HA verifies with {{ (device_key + alarm_pin) | hash('sha256') }}
-#    — no Python or external tools needed.
+# 3. PIN verification — the entered PIN is sent directly to HA over the
+#    encrypted API channel.  HA's alarm_control_panel verifies it against its
+#    own configured code.  No Blueprint or extra automation is required.
 #
-# FRIEND SETUP (zero flashing required, ~3/10 complexity)
+# FRIEND SETUP (zero flashing required, ~2/10 complexity)
 # ───────────────────────────────────────────────────────
 # 1. Power on → device creates "Alarm Keypad Setup" hotspot (open, no password)
 # 2. Connect phone → captive portal → enter home WiFi credentials
 # 3. HA discovers device → asks for API encryption key →
 #      open http://alarm-keypad.local/ → copy "Setup Key" → paste → done
-# 4. Import the HA Blueprint → paste the same Setup Key → enter alarm entity
-#    and alarm PIN → save
+#    The keypad is now live.  No Blueprint, no automation, no extra steps.
 #
 # OTA password:         alarm-keypad-factory-ota
 # Default alarm entity: alarm_control_panel.home_alarm
@@ -49,7 +47,7 @@ esphome:
   friendly_name: ${friendly_name}
   name_add_mac_suffix: true    # → alarm-keypad-a1b2c3  (unique per device)
   includes:
-    - alarm_keypad_security.h  # SHA-256, key generation, NVS helpers
+    - alarm_keypad_security.h  # key generation, NVS helpers
   on_boot:
     # ── Priority 400: load/generate per-device key, install as API PSK ────────
     # Runs after NVS is ready (preferences at 600) but before WiFi (200) and
@@ -62,7 +60,7 @@ esphome:
               // Override the compiled placeholder PSK with the device key.
               auto psk = key_to_psk(key);
               id(my_api)->set_noise_psk(psk);
-              // Cache in globals for HMAC and display use.
+              // Cache in globals for display use.
               id(device_key)  = key;
               id(device_code) = derive_display_code(key);
               ESP_LOGI("factory", "Device key ready, ID: %s", id(device_code).c_str());
@@ -158,12 +156,6 @@ globals:
 
   # Digit buffer for the current keypad entry session.
   - id: entered_code
-    type: std::string
-    restore_value: false
-    initial_value: '""'
-
-  # Computed hash stored briefly between lambda and the event action.
-  - id: pending_hmac
     type: std::string
     restore_value: false
     initial_value: '""'
@@ -329,9 +321,9 @@ script:
       - rtttl.play: "alarm:d=8,o=5,b=240:c6,p,c6,p,c6,p,c6"
 
   # ── PIN submission ──────────────────────────────────────────────────────────
-  # Computes SHA-256(device_key + entered_pin) and fires an HA event with the
-  # hash.  The raw PIN never leaves the device.
-  # HA's Blueprint verifies: {{ (device_key + alarm_pin) | hash('sha256') }}
+  # Sends the entered PIN directly to HA over the encrypted API channel.
+  # HA's alarm_control_panel verifies it against its own configured code.
+  # No Blueprint or automation required.
   - id: submit_code
     then:
       - if:
@@ -340,20 +332,24 @@ script:
           then:
             - script.execute: beep_error
           else:
-            - lambda: |-
-                id(pending_hmac) = sha256_hex(
-                    id(device_key) + id(entered_code));
-                id(entered_code) = "";
-
-            - homeassistant.event:
-                event: "esphome.alarm_keypad_code"
-                data:
-                  hmac: !lambda 'return id(pending_hmac);'
-                  action: !lambda |-
-                    std::string st = id(ha_alarm_state).state;
-                    if (st == "disarmed") return std::string("arm_away");
-                    return std::string("disarm");
-                  device: "${device_name}"
+            - if:
+                condition:
+                  lambda: 'return id(ha_alarm_state).state == "disarmed";'
+                then:
+                  - homeassistant.service:
+                      service: alarm_control_panel.alarm_arm_away
+                      data:
+                        entity_id: "${alarm_entity}"
+                      data_template:
+                        code: !lambda 'return id(entered_code);'
+                else:
+                  - homeassistant.service:
+                      service: alarm_control_panel.alarm_disarm
+                      data:
+                        entity_id: "${alarm_entity}"
+                      data_template:
+                        code: !lambda 'return id(entered_code);'
+            - lambda: 'id(entered_code) = "";'
 
 # =============================================================================
 # Text sensors
