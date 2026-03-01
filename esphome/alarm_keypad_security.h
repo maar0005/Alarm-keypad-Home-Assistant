@@ -3,34 +3,36 @@
 // alarm_keypad_security.h
 // Security helpers for alarm-keypad-factory firmware
 //
-// Included via esphome: includes: [alarm_keypad_security.h]
-// Uses mbedTLS which is bundled with both esp-idf and Arduino (ESP32).
+// Uses SHA-256 (mbedTLS, bundled with ESP-IDF and Arduino for ESP32).
+// HA's Jinja2 template engine supports {{ value | hash('sha256') }} natively,
+// so no Python or external tools are needed on the HA side.
 // =============================================================================
 
 #include <string>
 #include <cstdio>
 #include <cctype>
-#include "mbedtls/md.h"
-#include "esp_random.h"   // esp_random() — hardware RNG on ESP32
+#include "mbedtls/sha256.h"
+#include "esp_random.h"   // hardware RNG on ESP32
 
 // -----------------------------------------------------------------------------
-// hmac_sha256_hex(key, message) → 64-char lowercase hex string
+// sha256_hex(input) → 64-char lowercase hex string
 //
-// The PIN entered on the keypad is NEVER transmitted.
-// Only HMAC-SHA256(PIN, device_salt) is sent to HA.
-// Without the device_salt, the HMAC cannot be reversed to recover the PIN.
+// The device computes SHA-256(device_salt + entered_pin) and sends only that
+// hash to HA.  The raw PIN never leaves the device.
+//
+// HA verifies with:
+//   {{ (device_salt + alarm_pin) | hash('sha256') == received_hash }}
+// — no Python or external tools required.
 // -----------------------------------------------------------------------------
-inline std::string hmac_sha256_hex(const std::string& key, const std::string& msg) {
+inline std::string sha256_hex(const std::string& input) {
     uint8_t raw[32];
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
-    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), /*hmac=*/1);
-    mbedtls_md_hmac_starts(&ctx,
-        reinterpret_cast<const unsigned char*>(key.data()), key.size());
-    mbedtls_md_hmac_update(&ctx,
-        reinterpret_cast<const unsigned char*>(msg.data()), msg.size());
-    mbedtls_md_hmac_finish(&ctx, raw);
-    mbedtls_md_free(&ctx);
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, /*is_224=*/0);
+    mbedtls_sha256_update(&ctx,
+        reinterpret_cast<const unsigned char*>(input.data()), input.size());
+    mbedtls_sha256_finish(&ctx, raw);
+    mbedtls_sha256_free(&ctx);
 
     char hex[65];
     for (int i = 0; i < 32; i++) sprintf(hex + 2 * i, "%02x", raw[i]);
@@ -40,8 +42,7 @@ inline std::string hmac_sha256_hex(const std::string& key, const std::string& ms
 
 // -----------------------------------------------------------------------------
 // generate_device_salt() → 32-char hex string (16 bytes from hardware RNG)
-//
-// Called once on first boot.  Stored in NVS via a globals restore_value.
+// Called once on first boot; stored in NVS via a restore_value global.
 // -----------------------------------------------------------------------------
 inline std::string generate_device_salt() {
     uint32_t r[4];
@@ -53,10 +54,8 @@ inline std::string generate_device_salt() {
 }
 
 // -----------------------------------------------------------------------------
-// derive_display_code(salt) → 6-char uppercase pairing code
-//
-// Shown on the LCD in provisioning mode.  HA must send this code back to
-// the device to complete pairing.  Physically verifies the user is present.
+// derive_display_code(salt) → 6-char uppercase pairing code shown on LCD.
+// Also exposed as a HA sensor so it can be copy-pasted into the pairing field.
 // -----------------------------------------------------------------------------
 inline std::string derive_display_code(const std::string& salt) {
     if (salt.size() < 6) return "??????";
