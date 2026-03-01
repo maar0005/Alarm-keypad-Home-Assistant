@@ -3,19 +3,22 @@ blueprint:
   description: >
     Handles `esphome.alarm_keypad_code` events from the Alarm Keypad factory
     firmware.  The keypad never sends the raw PIN — it sends
-    SHA-256(device_salt + PIN) instead.  This automation verifies the hash
+    SHA-256(device_key + PIN) instead.  This automation verifies the hash
     using HA's built-in template filter and calls the alarm service on match.
 
     **No Python or external tools required.**
-    Everything is done inside Home Assistant.
+    Everything runs inside Home Assistant.
 
     **One-time setup per device:**
 
-    1. In HA → go to the Alarm Keypad device page.
-    2. Find **Device Salt** (diagnostic sensor) → copy the value.
-    3. Find **Device Code** (diagnostic sensor) → copy and paste it into the
-       **Pairing Code** text field on the same page to activate the keypad.
-    4. Import this Blueprint and fill in the fields below.
+    1. Power on the keypad → connect to "Alarm Keypad Setup" hotspot →
+       enter your home WiFi password.
+    2. HA discovers the device and asks for an **API encryption key** →
+       open `http://alarm-keypad.local/` (or the device's IP address) →
+       copy the **Setup Key** value → paste it into HA.
+    3. Import this Blueprint → fill in the three fields below → save.
+
+    The **Device Key** field uses the same Setup Key you copied in step 2.
 
   domain: automation
   author: maar0005
@@ -38,18 +41,19 @@ blueprint:
         text:
           type: password
 
-    device_salt:
-      name: Device Salt
+    device_key:
+      name: Device Key
       description: >
-        Copy from the Alarm Keypad device page → Device Salt diagnostic sensor.
-        This is the unique per-device value used to hash the PIN.
+        The unique per-device key shown on the device web page
+        (`http://alarm-keypad.local/` → **Setup Key**).
+        This is the same value you pasted into HA as the API encryption key.
       selector:
         text:
 
     device_name:
       name: Device name (optional, for multiple keypads)
       description: >
-        The ESPHome device name, e.g. `alarm-keypad-a1b2c3`.
+        The ESPHome device name suffix, e.g. `alarm-keypad-a1b2c3`.
         Leave blank if you only have one keypad.
       default: ""
       selector:
@@ -67,17 +71,17 @@ condition:
 
 action:
   - variables:
-      received_hash: "{{ trigger.event.data.get('hash', '') }}"
+      received_hmac: "{{ trigger.event.data.get('hmac', '') }}"
       action:        "{{ trigger.event.data.get('action', 'disarm') }}"
       # HA computes the expected hash the same way the device does:
-      # SHA-256(device_salt + alarm_pin)
-      expected_hash: "{{ (inputs.device_salt + inputs.alarm_pin) | hash('sha256') }}"
-      hash_ok: "{{ received_hash == expected_hash }}"
+      # SHA-256(device_key_base64 + alarm_pin)
+      expected_hmac: "{{ (inputs.device_key + inputs.alarm_pin) | hash('sha256') }}"
+      hmac_ok: "{{ received_hmac == expected_hmac }}"
 
   - choose:
       - conditions:
           - condition: template
-            value_template: "{{ action == 'disarm' and hash_ok }}"
+            value_template: "{{ action == 'disarm' and hmac_ok }}"
         sequence:
           - service: alarm_control_panel.alarm_disarm
             target:
@@ -87,7 +91,7 @@ action:
 
       - conditions:
           - condition: template
-            value_template: "{{ action == 'arm_away' and hash_ok }}"
+            value_template: "{{ action == 'arm_away' and hmac_ok }}"
         sequence:
           - service: alarm_control_panel.alarm_arm_away
             target:
@@ -95,13 +99,14 @@ action:
 
       - conditions:
           - condition: template
-            value_template: "{{ not hash_ok }}"
+            value_template: "{{ not hmac_ok }}"
         sequence:
           - service: system_log.write
             data:
               message: >
-                Alarm Keypad: wrong PIN hash received. Wrong PIN entered or
-                Blueprint misconfigured (check device_salt matches the sensor).
+                Alarm Keypad: wrong PIN hash received. Either the wrong PIN
+                was entered or the Device Key in this Blueprint does not match
+                the Setup Key shown on the device web page.
               level: warning
 
 mode: single

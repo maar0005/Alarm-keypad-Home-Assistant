@@ -7,28 +7,31 @@
 #
 # SECURITY MODEL
 # ──────────────
-# 1. API channel  — encrypted with a fixed shared key (AES-256, noise protocol).
-#                   All traffic including HA events is ciphertext on the LAN.
-# 2. PIN in transit — the raw PIN is NEVER sent.  The device computes
-#                   SHA-256(device_salt + PIN) and fires an HA event with only
-#                   the hash.  HA verifies with {{ (salt+pin)|hash('sha256') }}
-#                   — no Python or external tools needed.
-# 3. Pairing code — each device generates a unique 6-char code on first boot
-#                   (from hardware RNG).  HA must send this code back before the
-#                   keypad activates.  Proves physical presence near the device.
-#                   The code is also exposed as a HA sensor → copy/paste in HA.
+# 1. Per-device random key — generated at first boot using the ESP32 hardware
+#    RNG (esp_fill_random).  32 bytes / 256 bits, stored in NVS.  Each device
+#    has a completely different key.  The key is shown on the device web page
+#    so the owner can copy it during setup without reading any documentation.
 #
-# FRIEND SETUP (zero flashing required)
-# ──────────────────────────────────────
-# 1. Power on → device creates "Alarm Keypad Setup" hotspot
-# 2. Connect phone → captive portal → enter home WiFi
-# 3. HA discovers device → paste API key → added
-# 4. In HA device page: copy Device Code → paste into Pairing Code field
-# 5. Import the HA Blueprint → enter alarm entity + alarm PIN → done
+# 2. API transport encryption — the same key is loaded at boot priority 400
+#    (before the API server accepts connections) and installed as the ESPHome
+#    Noise PSK.  All traffic between the device and HA is ciphertext on the
+#    LAN; a LAN observer cannot capture or replay keypad events.
 #
-# API KEY (shared, document this to friends)
-# api_encryption_key: h2X47wkx8LQ7Tedqvw7e6QCFqWzkdL1GihMCvwyy3nQ=
-# OTA password:       alarm-keypad-factory-ota
+# 3. PIN hashing — the raw PIN is NEVER sent.  The device computes
+#    SHA-256(device_key_base64 + entered_pin) and fires an HA event with only
+#    the hash.  HA verifies with {{ (device_key + alarm_pin) | hash('sha256') }}
+#    — no Python or external tools needed.
+#
+# FRIEND SETUP (zero flashing required, ~3/10 complexity)
+# ───────────────────────────────────────────────────────
+# 1. Power on → device creates "Alarm Keypad Setup" hotspot (open, no password)
+# 2. Connect phone → captive portal → enter home WiFi credentials
+# 3. HA discovers device → asks for API encryption key →
+#      open http://alarm-keypad.local/ → copy "Setup Key" → paste → done
+# 4. Import the HA Blueprint → paste the same Setup Key → enter alarm entity
+#    and alarm PIN → save
+#
+# OTA password:         alarm-keypad-factory-ota
 # Default alarm entity: alarm_control_panel.home_alarm
 # =============================================================================
 
@@ -36,7 +39,9 @@ substitutions:
   device_name: alarm-keypad
   friendly_name: "Alarm Keypad"
   alarm_entity: "alarm_control_panel.home_alarm"
-  api_key: "h2X47wkx8LQ7Tedqvw7e6QCFqWzkdL1GihMCvwyy3nQ="
+  # Placeholder PSK — enables Noise encryption at compile time.
+  # Overwritten at boot priority 400 with the per-device random key from NVS.
+  api_key_placeholder: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
   ota_password: "alarm-keypad-factory-ota"
 
 esphome:
@@ -44,27 +49,37 @@ esphome:
   friendly_name: ${friendly_name}
   name_add_mac_suffix: true    # → alarm-keypad-a1b2c3  (unique per device)
   includes:
-    - alarm_keypad_security.h  # HMAC-SHA256 helpers
+    - alarm_keypad_security.h  # SHA-256, key generation, NVS helpers
   on_boot:
-    priority: -10              # after WiFi & API are up
-    then:
-      - lambda: |-
-          id(boot_count) += 1;
-          // First-boot: generate unique device salt and derive display code
-          if (id(device_salt).empty()) {
-            id(device_salt) = generate_device_salt();
-            id(device_code) = derive_display_code(id(device_salt));
-            ESP_LOGI("factory", "First boot — salt generated, code: %s",
-                     id(device_code).c_str());
-          } else if (id(device_code).empty()) {
-            // Rebuild code if lost (e.g. firmware update)
-            id(device_code) = derive_display_code(id(device_salt));
-          }
-      - light.turn_on:
-          id: status_led
-          effect: "Pulse Blue"
-      - delay: 2s
-      - component.update: my_lcd
+    # ── Priority 400: load/generate per-device key, install as API PSK ────────
+    # Runs after NVS is ready (preferences at 600) but before WiFi (200) and
+    # the API server (-100), so HA always sees the correct per-device PSK.
+    - priority: 400
+      then:
+        - lambda: |-
+            std::string key = ensure_device_key();
+            if (key.size() == 44) {
+              // Override the compiled placeholder PSK with the device key.
+              auto psk = key_to_psk(key);
+              id(my_api)->set_noise_psk(psk);
+              // Cache in globals for HMAC and display use.
+              id(device_key)  = key;
+              id(device_code) = derive_display_code(key);
+              ESP_LOGI("factory", "Device key ready, ID: %s", id(device_code).c_str());
+            } else {
+              ESP_LOGE("factory", "Device key generation failed");
+            }
+
+    # ── Priority -10: post-WiFi/API tasks ─────────────────────────────────────
+    - priority: -10
+      then:
+        - lambda: 'id(boot_count) += 1;'
+        - component.update: exposed_setup_key  # push key value to web server
+        - light.turn_on:
+            id: status_led
+            effect: "Pulse Blue"
+        - delay: 2s
+        - component.update: my_lcd
 
 esp32:
   board: um_feathers3
@@ -75,8 +90,9 @@ logger:
   level: INFO
 
 api:
+  id: my_api
   encryption:
-    key: ${api_key}
+    key: ${api_key_placeholder}   # placeholder; overwritten at boot priority 400
 
 ota:
   - platform: esphome
@@ -94,8 +110,8 @@ improv_serial:
 
 captive_portal:
 
-# Web server at http://<device-ip>/  — shows all sensor values and lets
-# the owner change the alarm entity without reflashing.
+# Web server at http://<device-ip>/  — shows all sensor values including the
+# Setup Key.  Copy the key from here during initial HA pairing.
 web_server:
   port: 80
 
@@ -125,26 +141,20 @@ globals:
     restore_value: true
     initial_value: "0"
 
-  # Hardware-RNG salt generated once at first boot; persists in NVS.
-  # Used as the HMAC key so each device produces different HMACs for the same PIN.
-  - id: device_salt
+  # Per-device key loaded at boot priority 400 from NVS.
+  # NOT restore_value — managed directly via NVS helpers in security.h.
+  - id: device_key
     type: std::string
-    restore_value: true
+    restore_value: false
     initial_value: '""'
 
-  # 6-char uppercase pairing code derived from device_salt.
-  # Shown on LCD until HA completes pairing.
+  # 6-char uppercase device identifier derived from device_key.
+  # Shown on LCD so the owner can identify which physical device they're
+  # looking at.  NOT a security gate.
   - id: device_code
     type: std::string
-    restore_value: true
+    restore_value: false
     initial_value: '""'
-
-  # True once HA has verified the pairing code.
-  # Keypad events are suppressed while false.
-  - id: is_paired
-    type: bool
-    restore_value: true
-    initial_value: "false"
 
   # Digit buffer for the current keypad entry session.
   - id: entered_code
@@ -152,7 +162,7 @@ globals:
     restore_value: false
     initial_value: '""'
 
-  # Computed HMAC stored briefly between lambda and the event action.
+  # Computed hash stored briefly between lambda and the event action.
   - id: pending_hmac
     type: std::string
     restore_value: false
@@ -184,24 +194,24 @@ display:
     address: 0x27
     update_interval: 500ms
     lambda: |-
-      if (!id(is_paired)) {
-        // ── Pairing mode ───────────────────────────────────────────────
-        // Line 1: pairing code
-        // Line 2: brief hint that rotates every 2 s
+      std::string st = id(ha_alarm_state).state;
+
+      if (st.empty()) {
+        // ── Not yet connected to HA ─────────────────────────────────────────
+        // Show device ID and status hint so user knows which device to look up.
         std::string code = id(device_code).empty() ? "......" : id(device_code);
-        it.printf(0, 0, "Pair: %-10s", code.c_str());
+        it.printf(0, 0, "ID: %-12s", code.c_str());
 
         uint32_t tick = millis() / 2000;
         switch (tick % 3) {
           case 0: it.print(0, 1, "Open HA, add me "); break;
-          case 1: it.print(0, 1, "Send code to me "); break;
+          case 1: it.print(0, 1, "See web for key "); break;
           case 2: it.print(0, 1, wifi_connected()
                               ? "WiFi OK         "
                               : "Connect WiFi AP "); break;
         }
       } else {
-        // ── Normal mode ────────────────────────────────────────────────
-        std::string st = id(ha_alarm_state).state;
+        // ── Normal mode ─────────────────────────────────────────────────────
         const char* label;
         if      (st == "disarmed")       label = "DISARMED       ";
         else if (st == "armed_away")     label = "ARMED AWAY     ";
@@ -319,43 +329,31 @@ script:
       - rtttl.play: "alarm:d=8,o=5,b=240:c6,p,c6,p,c6,p,c6"
 
   # ── PIN submission ──────────────────────────────────────────────────────────
-  # Computes HMAC-SHA256(entered_PIN, device_salt).
-  # The raw PIN never leaves the device — only its HMAC is sent to HA.
-  # HA's companion automation verifies the HMAC using the stored device_salt.
+  # Computes SHA-256(device_key + entered_pin) and fires an HA event with the
+  # hash.  The raw PIN never leaves the device.
+  # HA's Blueprint verifies: {{ (device_key + alarm_pin) | hash('sha256') }}
   - id: submit_code
     then:
       - if:
           condition:
-            lambda: 'return !id(is_paired);'
+            lambda: 'return id(entered_code).empty();'
           then:
-            # Keypad locked until pairing is complete
             - script.execute: beep_error
           else:
-            - if:
-                condition:
-                  lambda: 'return id(entered_code).empty();'
-                then:
-                  - script.execute: beep_error
-                else:
-                  # Hash the PIN: SHA-256(device_salt + entered_pin)
-                  # The raw PIN never leaves the device — only the hash is sent.
-                  # HA verifies with: {{ (salt + pin) | hash('sha256') }}
-                  - lambda: |-
-                      id(pending_hmac) = sha256_hex(
-                          id(device_salt) + id(entered_code));
-                      id(entered_code) = "";
+            - lambda: |-
+                id(pending_hmac) = sha256_hex(
+                    id(device_key) + id(entered_code));
+                id(entered_code) = "";
 
-                  # Send HMAC + intended action to HA as an event.
-                  # HA automation verifies HMAC, then calls the alarm service.
-                  - homeassistant.event:
-                      event: "esphome.alarm_keypad_code"
-                      data:
-                        hmac: !lambda 'return id(pending_hmac);'
-                        action: !lambda |-
-                          std::string st = id(ha_alarm_state).state;
-                          if (st == "disarmed") return std::string("arm_away");
-                          return std::string("disarm");
-                        device: "${device_name}"
+            - homeassistant.event:
+                event: "esphome.alarm_keypad_code"
+                data:
+                  hmac: !lambda 'return id(pending_hmac);'
+                  action: !lambda |-
+                    std::string st = id(ha_alarm_state).state;
+                    if (st == "disarmed") return std::string("arm_away");
+                    return std::string("disarm");
+                  device: "${device_name}"
 
 # =============================================================================
 # Text sensors
@@ -438,16 +436,18 @@ text_sensor:
 
         - component.update: my_lcd
 
-  # Expose device_salt to HA during pairing so HA can store it for
-  # HMAC verification.  Only readable once — consider the encryption key your
-  # channel protection here.
+  # ── Setup Key ──────────────────────────────────────────────────────────────
+  # The unique per-device key shown on the device web page.
+  # Copy this value when:
+  #   • HA asks for the API encryption key (during device discovery)
+  #   • The Blueprint asks for the Device Key field
   - platform: template
-    id: exposed_device_salt
-    name: "${friendly_name} Device Salt"
+    id: exposed_setup_key
+    name: "${friendly_name} Setup Key"
+    icon: "mdi:key-variant"
     lambda: |-
-      return id(device_salt);
+      return id(device_key);
     update_interval: never
-    entity_category: diagnostic
 
   - platform: wifi_info
     ip_address:
@@ -457,33 +457,6 @@ text_sensor:
 # Text inputs from HA
 # =============================================================================
 text:
-  # ── Pairing code input ─────────────────────────────────────────────────────
-  # HA writes the 6-char code shown on the device LCD.
-  # Device verifies it matches before enabling the keypad.
-  - platform: template
-    id: pair_code_input
-    name: "${friendly_name} Pairing Code"
-    optimistic: true
-    min_length: 6
-    max_length: 6
-    mode: text
-    initial_value: ""
-    on_value:
-      then:
-        - lambda: |-
-            std::string entered = x;
-            for (char& c : entered) c = static_cast<char>(toupper(c));
-            std::string expected = id(device_code);
-
-            if (!id(is_paired) && entered == expected) {
-              id(is_paired) = true;
-              ESP_LOGI("pair", "Pairing successful");
-            } else if (!id(is_paired)) {
-              ESP_LOGW("pair", "Wrong pairing code: %s (expected %s)",
-                       entered.c_str(), expected.c_str());
-              id(beep_error).execute();
-            }
-
   # ── LCD message override ────────────────────────────────────────────────────
   - platform: template
     id: lcd_message
@@ -549,7 +522,7 @@ matrix_keypad:
       # Quick-arm shortcuts (no PIN required — HA panel decides whether to enforce)
       - if:
           condition:
-            lambda: 'return x == "A" && id(is_paired) && id(ha_alarm_state).state == "disarmed";'
+            lambda: 'return x == "A" && id(ha_alarm_state).state == "disarmed";'
           then:
             - homeassistant.service:
                 service: alarm_control_panel.alarm_arm_away
@@ -558,7 +531,7 @@ matrix_keypad:
 
       - if:
           condition:
-            lambda: 'return x == "B" && id(is_paired) && id(ha_alarm_state).state == "disarmed";'
+            lambda: 'return x == "B" && id(ha_alarm_state).state == "disarmed";'
           then:
             - homeassistant.service:
                 service: alarm_control_panel.alarm_arm_home
@@ -567,7 +540,7 @@ matrix_keypad:
 
       - if:
           condition:
-            lambda: 'return x == "C" && id(is_paired) && id(ha_alarm_state).state == "disarmed";'
+            lambda: 'return x == "C" && id(ha_alarm_state).state == "disarmed";'
           then:
             - homeassistant.service:
                 service: alarm_control_panel.alarm_arm_night
@@ -699,18 +672,23 @@ button:
   - platform: restart
     name: "${friendly_name} Restart"
 
-  # Factory reset — clears pairing and regenerates device salt.
-  # Use if a device needs to be re-paired with a new HA instance.
+  # Factory reset — generates a new random key, clears NVS, restarts device.
+  # Use when re-assigning the device to a new HA instance or new owner.
+  # After reset, HA must be reconfigured with the new Setup Key.
   - platform: template
     name: "${friendly_name} Factory Reset"
     entity_category: config
     on_press:
       then:
         - lambda: |-
-            id(is_paired) = false;
-            id(device_salt) = generate_device_salt();
-            id(device_code) = derive_display_code(id(device_salt));
+            std::string key = generate_device_key();
+            nvs_save_device_key(key);
+            id(device_key)  = key;
+            id(device_code) = derive_display_code(key);
+            auto psk = key_to_psk(key);
+            id(my_api)->set_noise_psk(psk);
             id(entered_code) = "";
-            ESP_LOGW("factory", "Factory reset — new code: %s",
+            ESP_LOGW("factory", "Factory reset — new key ID: %s",
                      id(device_code).c_str());
+        - component.update: exposed_setup_key
         - component.update: my_lcd
