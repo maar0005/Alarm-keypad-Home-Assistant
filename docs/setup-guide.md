@@ -170,7 +170,74 @@ HA alarm panel config, not in the ESPHome YAML.
 
 ---
 
-## 10. OTA Updates
+## 10. NeoPixel Colour via HA Template Sensor
+
+The keypad subscribes to `sensor.alarm_led_farve` in HA.  Whenever that
+sensor's state changes to an `"R,G,B"` string the NeoPixel is updated
+immediately (any active pulse/flash effect is cancelled first).
+
+Add the following to your `configuration.yaml` (or an included file):
+
+```yaml
+template:
+  - sensor:
+      - name: "Alarm LED Farve"
+        unique_id: alarm_led_farve
+        # scan_interval forces re-evaluation every second so the
+        # red/blue alternation during 'pending' actually blinks at 1 Hz.
+        scan_interval: 1
+        state: >-
+          {# ── 1. Check for low battery across all door/window sensors ── #}
+          {% set ns = namespace(lav_batteri=false) %}
+          {% set alle_sensorer = expand('binary_sensor.vinduer', 'binary_sensor.dorene') %}
+          {% for entity in alle_sensorer %}
+            {% set bat_id = entity.entity_id
+                | replace('binary_sensor.', 'sensor.')
+                | replace('_contact', '_battery') %}
+            {% if states(bat_id) | float(100) < 30 %}
+              {% set ns.lav_batteri = true %}
+            {% endif %}
+          {% endfor %}
+          {# ── 2. Map alarm state → R,G,B ── #}
+          {% set status = states('alarm_control_panel.home_alarm') %}
+          {% if status == 'triggered' %}
+            255,0,0
+          {% elif status == 'pending' %}
+            {% if now().second % 2 == 0 %} 255,0,0 {% else %} 0,0,255 {% endif %}
+          {% elif status == 'arming' %}
+            0,0,255
+          {% elif status in ['armed_away', 'armed_home', 'armed_night', 'armed_vacation'] %}
+            255,0,0
+          {% elif ns.lav_batteri %}
+            255,191,0
+          {% elif status == 'disarmed' %}
+            0,255,0
+          {% else %}
+            255,255,255
+          {% endif %}
+```
+
+**Colour map:**
+
+| State | Colour | R,G,B |
+|---|---|---|
+| `triggered` | Solid red | `255,0,0` |
+| `pending` (entry delay) | 1 Hz red ↔ blue | alternates |
+| `arming` (exit delay) | Solid blue | `0,0,255` |
+| `armed_*` | Solid red | `255,0,0` |
+| Disarmed + low battery (<30 %) | Amber | `255,191,0` |
+| `disarmed` | Solid green | `0,255,0` |
+| Unknown | White | `255,255,255` |
+
+> **Note:** replace `binary_sensor.vinduer` and `binary_sensor.dorene` with
+> your own door/window group entity IDs, and adjust the `_contact` →
+> `_battery` name pattern to match your sensor naming convention.
+
+After adding the sensor, restart HA to create the entity.
+
+---
+
+## 11. OTA Updates
 
 After the first USB flash, all future updates go over WiFi:
 
@@ -184,7 +251,7 @@ The NeoPixel pulses blue on boot to confirm the update landed.
 
 ---
 
-## 11. Print and Assemble Enclosure
+## 12. Print and Assemble Enclosure
 
 See [`../3d-print/README.md`](../3d-print/README.md).
 
