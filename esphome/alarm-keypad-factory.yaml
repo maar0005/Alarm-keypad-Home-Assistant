@@ -432,6 +432,35 @@ text_sensor:
 
         - component.update: my_lcd
 
+  # ── HA-driven NeoPixel colour override ─────────────────────────────────────
+  # Create sensor.alarm_led_farve in HA and set its state to "R,G,B"
+  # (e.g. "255,0,0" for red) from an automation or template.  Whenever the
+  # value changes the NeoPixel is updated immediately.  Any active effect
+  # (pulse, flash) is replaced by the solid colour sent from HA.
+  - platform: homeassistant
+    id: alarm_led_color
+    entity_id: sensor.alarm_led_farve
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+            std::string s = x;
+            std::string delimiter = ",";
+            size_t pos = 0;
+            std::vector<int> rgb;
+            while ((pos = s.find(delimiter)) != std::string::npos) {
+              rgb.push_back(atoi(s.substr(0, pos).c_str()));
+              s.erase(0, pos + delimiter.length());
+            }
+            rgb.push_back(atoi(s.c_str()));
+            if (rgb.size() == 3) {
+              auto call = id(status_led).make_call();
+              call.set_effect("none");
+              call.set_rgb(rgb[0] / 255.0f, rgb[1] / 255.0f, rgb[2] / 255.0f);
+              call.set_brightness(1.0f);
+              call.perform();
+            }
+
   # ── Setup Key ──────────────────────────────────────────────────────────────
   # The unique per-device key shown on the device web page.
   # Copy this value when:
