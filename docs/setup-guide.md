@@ -203,10 +203,14 @@ template:
           {# Note: 'triggered' is intentionally omitted — ESPHome handles   #}
           {# the fast Alarm Flash effect (150 ms) directly on the device.    #}
           {% set status = states('alarm_control_panel.home_alarm') %}
-          {% if status == 'pending' %}
-            {% if now().second % 2 == 0 %} 0,0,0 {% else %} 255,192,0 {% endif %}
+          {% if status == 'pending' and now().second % 2 == 0 %}
+            0,0,0
+          {% elif status == 'pending' %}
+            255,192,0
+          {% elif status == 'arming' and now().second % 2 == 0 %}
+            0,0,0
           {% elif status == 'arming' %}
-            {% if now().second % 2 == 0 %} 0,0,0 {% else %} 0,0,255 {% endif %}
+            0,0,255
           {% elif status in ['armed_away', 'armed_home', 'armed_night', 'armed_vacation'] %}
             255,0,0
           {% elif ns.lav_batteri %}
