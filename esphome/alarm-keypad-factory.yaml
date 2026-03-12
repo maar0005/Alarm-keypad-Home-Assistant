@@ -454,6 +454,9 @@ text_sensor:
             }
             rgb.push_back(atoi(s.c_str()));
             if (rgb.size() == 3) {
+              // When triggered, ESPHome owns the LED (fast "Alarm Flash" effect).
+              // HA's 1 Hz sensor update would cancel it, so we skip the override.
+              if (id(ha_alarm_state).state == "triggered") return;
               auto call = id(status_led).make_call();
               call.set_effect("none");
               call.set_rgb(rgb[0] / 255.0f, rgb[1] / 255.0f, rgb[2] / 255.0f);

@@ -181,8 +181,7 @@ Add the following to your `configuration.yaml` (or an included file):
 ```yaml
 template:
   - trigger:
-      # Re-evaluate every second so the red/blue alternation during
-      # 'pending' actually blinks at 1 Hz.
+      # Re-evaluate every second — drives the 1 Hz blink for pending/arming.
       - platform: time_pattern
         seconds: "/1"
     sensor:
@@ -201,13 +200,13 @@ template:
             {% endif %}
           {% endfor %}
           {# ── 2. Map alarm state → R,G,B ── #}
+          {# Note: 'triggered' is intentionally omitted — ESPHome handles   #}
+          {# the fast Alarm Flash effect (150 ms) directly on the device.    #}
           {% set status = states('alarm_control_panel.home_alarm') %}
-          {% if status == 'triggered' %}
-            255,0,0
-          {% elif status == 'pending' %}
-            {% if now().second % 2 == 0 %} 255,0,0 {% else %} 0,0,255 {% endif %}
+          {% if status == 'pending' %}
+            {% if now().second % 2 == 0 %} 0,0,0 {% else %} 255,192,0 {% endif %}
           {% elif status == 'arming' %}
-            0,0,255
+            {% if now().second % 2 == 0 %} 0,0,0 {% else %} 0,0,255 {% endif %}
           {% elif status in ['armed_away', 'armed_home', 'armed_night', 'armed_vacation'] %}
             255,0,0
           {% elif ns.lav_batteri %}
@@ -221,15 +220,19 @@ template:
 
 **Colour map:**
 
-| State | Colour | R,G,B |
+| State | Effect | Colours |
 |---|---|---|
-| `triggered` | Solid red | `255,0,0` |
-| `pending` (entry delay) | 1 Hz red ↔ blue | alternates |
-| `arming` (exit delay) | Solid blue | `0,0,255` |
-| `armed_*` | Solid red | `255,0,0` |
-| Disarmed + low battery (<30 %) | Amber | `255,191,0` |
-| `disarmed` | Solid green | `0,255,0` |
-| Unknown | White | `255,255,255` |
+| `triggered` | Fast blink ~7 Hz (ESPHome) | red ↔ off |
+| `pending` (entry delay) | 1 Hz blink (HA) | off ↔ amber |
+| `arming` (exit delay) | 1 Hz blink (HA) | off ↔ blue |
+| `armed_*` | Solid | red |
+| Disarmed + low battery (<30 %) | Solid | amber |
+| `disarmed` | Solid | green |
+| Unknown | Solid | white |
+
+> `triggered` is handled entirely by ESPHome's built-in "Alarm Flash" effect
+> (150 ms on/off ≈ 7 Hz) — HA's 1 Hz sensor update is ignored by the device
+> while in this state, so the fast flash is never interrupted.
 
 > **Note:** replace `binary_sensor.vinduer` and `binary_sensor.dorene` with
 > your own door/window group entity IDs, and adjust the `_contact` →
