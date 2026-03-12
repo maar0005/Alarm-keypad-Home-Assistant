@@ -180,12 +180,14 @@ Add the following to your `configuration.yaml` (or an included file):
 
 ```yaml
 template:
-  - sensor:
+  - trigger:
+      # Re-evaluate every second so the red/blue alternation during
+      # 'pending' actually blinks at 1 Hz.
+      - platform: time_pattern
+        seconds: "/1"
+    sensor:
       - name: "Alarm LED Farve"
         unique_id: alarm_led_farve
-        # scan_interval forces re-evaluation every second so the
-        # red/blue alternation during 'pending' actually blinks at 1 Hz.
-        scan_interval: 1
         state: >-
           {# ── 1. Check for low battery across all door/window sensors ── #}
           {% set ns = namespace(lav_batteri=false) %}
