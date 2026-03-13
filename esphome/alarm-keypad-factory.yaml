@@ -82,7 +82,7 @@ esphome:
 esp32:
   board: um_feathers3
   framework:
-    type: arduino
+    type: esp-idf
 
 logger:
   level: INFO
@@ -91,6 +91,7 @@ api:
   id: my_api
   encryption:
     key: ${api_key_placeholder}   # placeholder; overwritten at boot priority 400
+  homeassistant_services: true
 
 ota:
   - platform: esphome
@@ -229,10 +230,10 @@ display:
 # NeoPixel — GPIO40 (FeatherS3 built-in)
 # =============================================================================
 light:
-  - platform: neopixelbus
+  - platform: esp32_rmt_led_strip
     id: status_led
-    type: GRB
-    variant: WS2812
+    rgb_order: GRB
+    chipset: WS2812
     pin: GPIO40
     num_leds: 1
     name: "${friendly_name} Status LED"
@@ -340,14 +341,12 @@ script:
                       service: alarm_control_panel.alarm_arm_away
                       data:
                         entity_id: "${alarm_entity}"
-                      data_template:
                         code: !lambda 'return id(entered_code);'
                 else:
                   - homeassistant.service:
                       service: alarm_control_panel.alarm_disarm
                       data:
                         entity_id: "${alarm_entity}"
-                      data_template:
                         code: !lambda 'return id(entered_code);'
             - lambda: 'id(entered_code) = "";'
 
