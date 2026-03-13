@@ -170,7 +170,83 @@ HA alarm panel config, not in the ESPHome YAML.
 
 ---
 
-## 10. OTA Updates
+## 10. NeoPixel Colour via HA Template Sensor
+
+The keypad subscribes to `sensor.alarm_led_farve` in HA.  Whenever that
+sensor's state changes to an `"R,G,B"` string the NeoPixel is updated
+immediately (any active pulse/flash effect is cancelled first).
+
+Add the following to your `configuration.yaml` (or an included file):
+
+```yaml
+template:
+  - trigger:
+      # Re-evaluate every second — drives the 1 Hz blink for pending/arming.
+      - platform: time_pattern
+        seconds: "/1"
+    sensor:
+      - name: "Alarm LED Farve"
+        unique_id: alarm_led_farve
+        state: >-
+          {# ── 1. Check for low battery across all door/window sensors ── #}
+          {% set ns = namespace(lav_batteri=false) %}
+          {% set alle_sensorer = expand('binary_sensor.vinduer', 'binary_sensor.dorene') %}
+          {% for entity in alle_sensorer %}
+            {% set bat_id = entity.entity_id
+                | replace('binary_sensor.', 'sensor.')
+                | replace('_contact', '_battery') %}
+            {% if states(bat_id) | float(100) < 30 %}
+              {% set ns.lav_batteri = true %}
+            {% endif %}
+          {% endfor %}
+          {# ── 2. Map alarm state → R,G,B ── #}
+          {# Note: 'triggered' is intentionally omitted — ESPHome handles   #}
+          {# the fast Alarm Flash effect (150 ms) directly on the device.    #}
+          {% set status = states('alarm_control_panel.home_alarm') %}
+          {% if status == 'pending' and now().second % 2 == 0 %}
+            0,0,0
+          {% elif status == 'pending' %}
+            255,192,0
+          {% elif status == 'arming' and now().second % 2 == 0 %}
+            0,0,0
+          {% elif status == 'arming' %}
+            0,0,255
+          {% elif status in ['armed_away', 'armed_home', 'armed_night', 'armed_vacation'] %}
+            255,0,0
+          {% elif ns.lav_batteri %}
+            255,191,0
+          {% elif status == 'disarmed' %}
+            0,255,0
+          {% else %}
+            255,255,255
+          {% endif %}
+```
+
+**Colour map:**
+
+| State | Effect | Colours |
+|---|---|---|
+| `triggered` | Fast blink ~7 Hz (ESPHome) | red ↔ off |
+| `pending` (entry delay) | 1 Hz blink (HA) | off ↔ amber |
+| `arming` (exit delay) | 1 Hz blink (HA) | off ↔ blue |
+| `armed_*` | Solid | red |
+| Disarmed + low battery (<30 %) | Solid | amber |
+| `disarmed` | Solid | green |
+| Unknown | Solid | white |
+
+> `triggered` is handled entirely by ESPHome's built-in "Alarm Flash" effect
+> (150 ms on/off ≈ 7 Hz) — HA's 1 Hz sensor update is ignored by the device
+> while in this state, so the fast flash is never interrupted.
+
+> **Note:** replace `binary_sensor.vinduer` and `binary_sensor.dorene` with
+> your own door/window group entity IDs, and adjust the `_contact` →
+> `_battery` name pattern to match your sensor naming convention.
+
+After adding the sensor, restart HA to create the entity.
+
+---
+
+## 11. OTA Updates
 
 After the first USB flash, all future updates go over WiFi:
 
@@ -184,7 +260,7 @@ The NeoPixel pulses blue on boot to confirm the update landed.
 
 ---
 
-## 11. Print and Assemble Enclosure
+## 12. Print and Assemble Enclosure
 
 See [`../3d-print/README.md`](../3d-print/README.md).
 
