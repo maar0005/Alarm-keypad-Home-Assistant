@@ -32,7 +32,7 @@ esphome:
 esp32:
   board: um_feathers3
   framework:
-    type: arduino
+    type: esp-idf
 
 logger:
   level: INFO
@@ -40,6 +40,7 @@ logger:
 api:
   encryption:
     key: !secret api_key
+  homeassistant_services: true
 
 ota:
   - platform: esphome
@@ -144,10 +145,10 @@ display:
 # Colour/effect mirrors HA alarm panel state
 # =============================================================================
 light:
-  - platform: neopixelbus
+  - platform: esp32_rmt_led_strip
     id: status_led
-    type: GRB
-    variant: WS2812
+    rgb_order: GRB
+    chipset: WS2812
     pin: GPIO40
     num_leds: 1
     name: "${friendly_name} Status LED"
@@ -481,7 +482,7 @@ matrix_keypad:
       # Quick-arm shortcuts — fire after beep_key finishes
       - if:
           condition:
-            lambda: 'return x == "A" && id(ha_alarm_state).state == "disarmed";'
+            lambda: "return x == 'A' && id(ha_alarm_state).state == \"disarmed\";"
           then:
             - homeassistant.service:
                 service: alarm_control_panel.alarm_arm_away
@@ -490,7 +491,7 @@ matrix_keypad:
 
       - if:
           condition:
-            lambda: 'return x == "B" && id(ha_alarm_state).state == "disarmed";'
+            lambda: "return x == 'B' && id(ha_alarm_state).state == \"disarmed\";"
           then:
             - homeassistant.service:
                 service: alarm_control_panel.alarm_arm_home
@@ -499,7 +500,7 @@ matrix_keypad:
 
       - if:
           condition:
-            lambda: 'return x == "C" && id(ha_alarm_state).state == "disarmed";'
+            lambda: "return x == 'C' && id(ha_alarm_state).state == \"disarmed\";"
           then:
             - homeassistant.service:
                 service: alarm_control_panel.alarm_arm_night
