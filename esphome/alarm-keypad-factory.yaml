@@ -518,13 +518,9 @@ matrix_keypad:
     - pin:
         number: GPIO14
         mode: INPUT_PULLUP
-  keys:
-    - "1234"
-    - "5678"
-    - "9*0#"
-    - "ABCD"
+  keys: "123456789*0#ABCD"
   has_diodes: false
-  on_key_pressed:
+  on_key:
     then:
       - lambda: |-
           char k = x;
