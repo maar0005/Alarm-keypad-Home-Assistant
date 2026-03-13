@@ -482,7 +482,7 @@ matrix_keypad:
       # Quick-arm shortcuts — fire after beep_key finishes
       - if:
           condition:
-            lambda: 'return x == "A" && id(ha_alarm_state).state == "disarmed";'
+            lambda: "return x == 'A' && id(ha_alarm_state).state == \"disarmed\";"
           then:
             - homeassistant.service:
                 service: alarm_control_panel.alarm_arm_away
@@ -491,7 +491,7 @@ matrix_keypad:
 
       - if:
           condition:
-            lambda: 'return x == "B" && id(ha_alarm_state).state == "disarmed";'
+            lambda: "return x == 'B' && id(ha_alarm_state).state == \"disarmed\";"
           then:
             - homeassistant.service:
                 service: alarm_control_panel.alarm_arm_home
@@ -500,7 +500,7 @@ matrix_keypad:
 
       - if:
           condition:
-            lambda: 'return x == "C" && id(ha_alarm_state).state == "disarmed";'
+            lambda: "return x == 'C' && id(ha_alarm_state).state == \"disarmed\";"
           then:
             - homeassistant.service:
                 service: alarm_control_panel.alarm_arm_night

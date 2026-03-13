@@ -199,7 +199,7 @@ display:
         switch (tick % 3) {
           case 0: it.print(0, 1, "Open HA, add me "); break;
           case 1: it.print(0, 1, "See web for key "); break;
-          case 2: it.print(0, 1, wifi_connected()
+          case 2: it.print(0, 1, network::is_connected()
                               ? "WiFi OK         "
                               : "Connect WiFi AP "); break;
         }
@@ -545,7 +545,7 @@ matrix_keypad:
       # Quick-arm shortcuts (no PIN required — HA panel decides whether to enforce)
       - if:
           condition:
-            lambda: 'return x == "A" && id(ha_alarm_state).state == "disarmed";'
+            lambda: "return x == 'A' && id(ha_alarm_state).state == \"disarmed\";"
           then:
             - homeassistant.service:
                 service: alarm_control_panel.alarm_arm_away
@@ -554,7 +554,7 @@ matrix_keypad:
 
       - if:
           condition:
-            lambda: 'return x == "B" && id(ha_alarm_state).state == "disarmed";'
+            lambda: "return x == 'B' && id(ha_alarm_state).state == \"disarmed\";"
           then:
             - homeassistant.service:
                 service: alarm_control_panel.alarm_arm_home
@@ -563,7 +563,7 @@ matrix_keypad:
 
       - if:
           condition:
-            lambda: 'return x == "C" && id(ha_alarm_state).state == "disarmed";'
+            lambda: "return x == 'C' && id(ha_alarm_state).state == \"disarmed\";"
           then:
             - homeassistant.service:
                 service: alarm_control_panel.alarm_arm_night
